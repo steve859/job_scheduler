@@ -1,3 +1,4 @@
+
 CREATE KEYSPACE IF NOT EXISTS scheduler
 WITH replication = {'class': 'SimpleStrategy', 'replication_factor' : 3};
 
@@ -15,7 +16,7 @@ CREATE TABLE IF NOT EXISTS job_history (
   job_id text,
   run_id uuid,
   worker_id text,
-  token bigint,
+  fencing_token bigint,
   start_at timestamp,
   end_at timestamp,
   status text,
@@ -25,7 +26,7 @@ CREATE TABLE IF NOT EXISTS job_history (
 CREATE TABLE IF NOT EXISTS locks (
   resource text PRIMARY KEY,
   holder text,
-  token bigint,
+  fencing_token bigint,
   expire_at timestamp,
   metadata map<text,text>
 );
