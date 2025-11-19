@@ -1,0 +1,15 @@
+global:
+  scrape_interval: 15s
+
+scrape_configs:
+  - job_name: "prometheus"
+    static_configs:
+      - targets: ["localhost:9090"]
+
+  - job_name: "workers"
+    static_configs:
+      - targets: ["worker1:8080"] # placeholder; worker exporter port when implemented
+
+  - job_name: "cassandra"
+    static_configs:
+      - targets: ["cassandra1:9103", "cassandra2:9103", "cassandra3:9103"]

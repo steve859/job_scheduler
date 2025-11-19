@@ -1,0 +1,94 @@
+# docker-compose.yml (no 'version' key to avoid deprecation warning)
+services:
+  cassandra1:
+    image: cassandra:3.11
+    container_name: cassandra1
+    hostname: cassandra1
+    environment:
+      - CASSANDRA_CLUSTER_NAME=dc1-cluster
+      - CASSANDRA_SEEDS=cassandra1
+      - CASSANDRA_DC=DC1
+    ports:
+      - "9042:9042"
+    volumes:
+      - cass1_data:/var/lib/cassandra
+    networks:
+      - cass_net
+
+  cassandra2:
+    image: cassandra:3.11
+    container_name: cassandra2
+    hostname: cassandra2
+    environment:
+      - CASSANDRA_CLUSTER_NAME=dc1-cluster
+      - CASSANDRA_SEEDS=cassandra1
+      - CASSANDRA_DC=DC1
+      - CASSANDRA_BROADCAST_ADDRESS=cassandra2
+    depends_on:
+      - cassandra1
+    volumes:
+      - cass2_data:/var/lib/cassandra
+    networks:
+      - cass_net
+
+  cassandra3:
+    image: cassandra:3.11
+    container_name: cassandra3
+    hostname: cassandra3
+    environment:
+      - CASSANDRA_CLUSTER_NAME=dc1-cluster
+      - CASSANDRA_SEEDS=cassandra1
+      - CASSANDRA_DC=DC1
+      - CASSANDRA_BROADCAST_ADDRESS=cassandra3
+    depends_on:
+      - cassandra1
+    volumes:
+      - cass3_data:/var/lib/cassandra
+    networks:
+      - cass_net
+
+  prometheus:
+    image: prom/prometheus:latest
+    container_name: prometheus
+    volumes:
+      - ./infra/prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+    ports:
+      - "9090:9090"
+    depends_on:
+      - cassandra1
+    networks:
+      - cass_net
+
+  grafana:
+    image: grafana/grafana:latest
+    container_name: grafana
+    ports:
+      - "3000:3000"
+    depends_on:
+      - prometheus
+    networks:
+      - cass_net
+    volumes:
+      - grafana_data:/var/lib/grafana
+
+  worker:
+    build:
+      context: ./worker
+    container_name: worker1
+    environment:
+      - CASSANDRA_CONTACT_POINT=cassandra1
+      - CASSANDRA_PORT=9042
+    depends_on:
+      - cassandra1
+    networks:
+      - cass_net
+
+volumes:
+  cass1_data:
+  cass2_data:
+  cass3_data:
+  grafana_data:
+
+networks:
+  cass_net:
+    driver: bridge
