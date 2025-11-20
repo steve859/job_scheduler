@@ -35,3 +35,11 @@ CREATE TABLE IF NOT EXISTS lock_seq (
   resource text PRIMARY KEY,
   last_seq bigint
 );
+
+
+CREATE TABLE IF NOT EXISTS lock_seq_shard (
+  resource text,
+  shard_id int,
+  last_seq bigint,
+  PRIMARY KEY ((resource), shard_id)
+);

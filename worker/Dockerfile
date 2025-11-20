@@ -1,4 +1,6 @@
-# placeholder worker image (keeps container alive)
-FROM busybox:1.36.1-uclibc
+FROM eclipse-temurin:17-jdk-jammy
+
 WORKDIR /app
-CMD ["sh", "-c", "while true; do sleep 3600; done"]
+COPY target/worker.jar /app/worker.jar
+# provide env example via docker-compose
+ENTRYPOINT ["java","-Xms256m","-Xmx512m","-jar","/app/worker.jar"]
