@@ -1,0 +1,4 @@
+com\example\worker\WorkerMain$JobsHandler.class
+com\example\worker\WorkerMain$MetricsHandler.class
+com\example\worker\WorkerMain$JobActionHandler.class
+com\example\worker\WorkerMain.class
