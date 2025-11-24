@@ -38,9 +38,10 @@ public class LockClient implements AutoCloseable {
     private final Random rand = new Random();
 
     public LockClient(String contactPoint, int port, String keyspace) {
+        String localDc = System.getenv().getOrDefault("CASS_LOCAL_DC", "DC1");
         this.session = CqlSession.builder()
                 .addContactPoint(new InetSocketAddress(contactPoint, port))
-                .withLocalDatacenter("datacenter1")
+                .withLocalDatacenter(localDc)
                 .withKeyspace(keyspace)
                 .build();
         this.keyspace = keyspace;
@@ -54,21 +55,23 @@ public class LockClient implements AutoCloseable {
         this.updateLockSeqIfStmt = session.prepare(
                 SimpleStatement.newInstance("UPDATE lock_seq SET last_seq = ? WHERE resource = ? IF last_seq = ?"));
 
-        // locks table
+        // locks table (resource_id + epoch-based takeover)
         this.insertLockIfNotExistsStmt = session.prepare(
                 SimpleStatement.newInstance(
-                        "INSERT INTO locks (resource, holder, fencing_token, expire_at) VALUES (?, ?, ?, ?) IF NOT EXISTS"));
+                        "INSERT INTO locks (resource_id, holder, fencing_token, expire_at, epoch) VALUES (?, ?, ?, ?, 0) IF NOT EXISTS"));
         this.selectLockStmt = session.prepare(
-                SimpleStatement.newInstance("SELECT holder, fencing_token, expire_at FROM locks WHERE resource = ?"));
+                SimpleStatement.newInstance(
+                        "SELECT holder, fencing_token, expire_at, epoch FROM locks WHERE resource_id = ?"));
+        // Takeover: when expired, increment epoch with CAS on epoch
         this.updateLockIfTokenStmt = session.prepare(
                 SimpleStatement.newInstance(
-                        "UPDATE locks SET holder = ?, fencing_token = ?, expire_at = ? WHERE resource = ? IF fencing_token = ?"));
+                        "UPDATE locks SET holder = ?, fencing_token = ?, expire_at = ?, epoch = ? WHERE resource_id = ? IF epoch = ?"));
         this.renewStmt = session.prepare(
                 SimpleStatement.newInstance(
-                        "UPDATE locks SET expire_at = ? WHERE resource = ? IF holder = ? AND fencing_token = ?"));
+                        "UPDATE locks SET expire_at = ? WHERE resource_id = ? IF holder = ? AND fencing_token = ?"));
         this.deleteIfHolderTokenStmt = session.prepare(
                 SimpleStatement
-                        .newInstance("DELETE FROM locks WHERE resource = ? IF holder = ? AND fencing_token = ?"));
+                        .newInstance("DELETE FROM locks WHERE resource_id = ? IF holder = ? AND fencing_token = ?"));
     }
 
     /**
@@ -125,7 +128,7 @@ public class LockClient implements AutoCloseable {
             final long token = nextSeq(resource, 10, seqBackoff);
             Instant expireAt = Instant.now().plusMillis(ttl.toMillis());
 
-            // Try INSERT IF NOT EXISTS
+            // Try INSERT IF NOT EXISTS (epoch starts at 0)
             BoundStatement ins = insertLockIfNotExistsStmt.bind(resource, holderId, token,
                     java.util.Date.from(expireAt));
             ResultSet res = session.execute(ins);
@@ -139,10 +142,12 @@ public class LockClient implements AutoCloseable {
             if (cur != null) {
                 java.util.Date curExpire = cur.get("expire_at", java.util.Date.class);
                 long curToken = cur.isNull("fencing_token") ? -1L : cur.getLong("fencing_token");
+                long curEpoch = cur.isNull("epoch") ? 0L : cur.getLong("epoch");
                 if (curExpire == null || curExpire.getTime() <= System.currentTimeMillis()) {
-                    // expired -> try CAS replace matching on token
-                    BoundStatement upd = updateLockIfTokenStmt.bind(holderId, token, java.util.Date.from(expireAt),
-                            resource, curToken);
+                    // expired -> try CAS replace using epoch increment (takeover)
+                    long nextEpoch = curEpoch + 1;
+                    BoundStatement upd = updateLockIfTokenStmt.bind(
+                            holderId, token, java.util.Date.from(expireAt), nextEpoch, resource, curEpoch);
                     ResultSet upr = session.execute(upd);
                     Row uprOne = upr.one();
                     if (uprOne != null && uprOne.getBoolean("[applied]")) {
@@ -175,9 +180,11 @@ public class LockClient implements AutoCloseable {
         if (cur != null) {
             java.util.Date curExpire = cur.get("expire_at", java.util.Date.class);
             long curToken = cur.isNull("fencing_token") ? -1L : cur.getLong("fencing_token");
+            long curEpoch = cur.isNull("epoch") ? 0L : cur.getLong("epoch");
             if (curExpire == null || curExpire.getTime() <= System.currentTimeMillis()) {
-                BoundStatement upd = updateLockIfTokenStmt.bind(holderId, token, java.util.Date.from(expireAt),
-                        resource, curToken);
+                long nextEpoch = curEpoch + 1;
+                BoundStatement upd = updateLockIfTokenStmt.bind(
+                        holderId, token, java.util.Date.from(expireAt), nextEpoch, resource, curEpoch);
                 ResultSet upr = session.execute(upd);
                 Row uprOne = upr.one();
                 if (uprOne != null && uprOne.getBoolean("[applied]")) {
