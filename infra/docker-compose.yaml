@@ -79,7 +79,7 @@ services:
     image: prom/prometheus:latest
     container_name: prometheus
     volumes:
-      - ./prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - ./prometheus:/etc/prometheus:ro
     ports:
       - "9090:9090"
     depends_on:
@@ -112,6 +112,8 @@ services:
       - WORKER_HTTP_PORT=8080
       - WORKER_POLL_INTERVAL_MS=1500
       - WORKER_BUCKETS=16
+    ports:
+      - "8080:8080"
     depends_on:
       cassandra1:
         condition: service_healthy

@@ -10,14 +10,19 @@ import com.datastax.oss.driver.api.core.cql.Row;
 
 import java.io.IOException;
 import java.io.OutputStream;
+import java.io.InputStream;
 import java.net.InetSocketAddress;
 import java.net.URI;
 import java.time.Duration;
 import java.time.Instant;
 import java.util.UUID;
+import java.util.Optional;
 import java.util.concurrent.Executors;
 import java.util.concurrent.atomic.AtomicLong;
 
+import com.fasterxml.jackson.databind.ObjectMapper;
+import com.fasterxml.jackson.databind.SerializationFeature;
+import com.fasterxml.jackson.datatype.jsr310.JavaTimeModule;
 import com.sun.net.httpserver.HttpExchange;
 import com.sun.net.httpserver.HttpHandler;
 import com.sun.net.httpserver.HttpServer;
@@ -38,28 +43,49 @@ public class WorkerMain {
         int buckets = Integer.parseInt(env("WORKER_BUCKETS", String.valueOf(DEFAULT_BUCKETS)));
         String localDc = env("CASS_LOCAL_DC", "DC1");
 
+        // Build session WITHOUT keyspace first to allow auto-create if missing
         CqlSession session = CqlSession.builder()
                 .addContactPoint(new InetSocketAddress(contactPoint, port))
                 .withLocalDatacenter(localDc)
-                .withKeyspace(keyspace)
                 .build();
 
-        LockClient lockClient = new LockClient(contactPoint, port, keyspace);
+        ensureKeyspace(session, keyspace);
+        // Switch to keyspace explicitly
+        session.execute("USE " + keyspace);
 
-        PreparedStatement insertJobStmt = session.prepare("INSERT INTO jobs (job_id, schedule, payload, max_duration_seconds, created_at) VALUES (?, ?, ?, ?, ?) IF NOT EXISTS");
-        PreparedStatement selectJobStmt = session.prepare("SELECT job_id, schedule, payload, max_duration_seconds, created_at FROM jobs WHERE job_id = ?");
-        PreparedStatement enqueueJobStmt = session.prepare("INSERT INTO jobs_sharded (bucket_id, scheduled_time, job_id, payload, status, attempts) VALUES (?, ?, ?, ?, 'pending', 0)");
-        PreparedStatement updateJobStatusStmt = session.prepare("UPDATE jobs_sharded SET status = ? WHERE bucket_id = ? AND scheduled_time = ? AND job_id = ?");
-        PreparedStatement insertHistoryStmt = session.prepare("INSERT INTO job_history (job_id, run_id, worker_id, fencing_token, start_at, end_at, status) VALUES (?, ?, ?, ?, ?, ?, ?) ");
-        PreparedStatement updateHistoryEndStmt = session.prepare("UPDATE job_history SET end_at = ?, status = ? WHERE job_id = ? AND run_id = ?");
-        PreparedStatement selectDueStmt = session.prepare("SELECT bucket_id, scheduled_time, job_id, payload, status, attempts FROM jobs_sharded WHERE bucket_id = ? AND status = 'pending' LIMIT 32");
+        LockClient lockClient = new LockClient(contactPoint, port, keyspace); // now keyspace exists
+
+        PreparedStatement insertJobStmt = session.prepare(
+                "INSERT INTO jobs (job_id, schedule, payload, max_duration_seconds, created_at) VALUES (?, ?, ?, ?, ?) IF NOT EXISTS");
+        PreparedStatement selectJobStmt = session.prepare(
+                "SELECT job_id, schedule, payload, max_duration_seconds, created_at FROM jobs WHERE job_id = ?");
+        PreparedStatement enqueueJobStmt = session.prepare(
+                "INSERT INTO jobs_sharded (bucket_id, scheduled_time, job_id, payload, status, attempts) VALUES (?, ?, ?, ?, 'pending', 0)");
+        PreparedStatement updateJobStatusStmt = session.prepare(
+                "UPDATE jobs_sharded SET status = ? WHERE bucket_id = ? AND scheduled_time = ? AND job_id = ?");
+        PreparedStatement insertHistoryStmt = session.prepare(
+                "INSERT INTO job_history (job_id, run_id, worker_id, fencing_token, start_at, end_at, status) VALUES (?, ?, ?, ?, ?, ?, ?) ");
+        PreparedStatement updateHistoryEndStmt = session
+                .prepare("UPDATE job_history SET end_at = ?, status = ? WHERE job_id = ? AND run_id = ?");
+        // NOTE: Filtering on non-primary-key column 'status' requires ALLOW FILTERING.
+        // For production: replace with materialized view or a separate pending table.
+        PreparedStatement selectDueStmt = session.prepare(
+                "SELECT bucket_id, scheduled_time, job_id, payload, status, attempts FROM jobs_sharded WHERE bucket_id = ? AND status = 'pending' LIMIT 32 ALLOW FILTERING");
+        PreparedStatement selectHistoryByJobStmt = session.prepare(
+                "SELECT run_id, start_at, end_at, status FROM job_history WHERE job_id = ?");
+
+        ObjectMapper mapper = new ObjectMapper();
+        // Enable JavaTime (Instant, etc.) serialization as ISO-8601 strings
+        mapper.registerModule(new JavaTimeModule());
+        mapper.disable(SerializationFeature.WRITE_DATES_AS_TIMESTAMPS);
 
         HttpServer server = HttpServer.create(new InetSocketAddress(httpPort), 0);
         server.createContext("/healthz", exchange -> respond(exchange, 200, "OK"));
         server.createContext("/metrics", new MetricsHandler());
-        server.createContext("/jobs", new JobsHandler(session, insertJobStmt, selectJobStmt, enqueueJobStmt, buckets));
+        server.createContext("/jobs", new JobsHandler(session, insertJobStmt, selectJobStmt, enqueueJobStmt,
+                selectHistoryByJobStmt, buckets, mapper));
         server.createContext("/jobs/run", exchange -> respond(exchange, 400, "Specify /jobs/{id}/run"));
-        server.createContext("/jobs/", new JobActionHandler(session, selectJobStmt, enqueueJobStmt, buckets));
+        server.createContext("/jobs/", new JobActionHandler(session, selectJobStmt, enqueueJobStmt, buckets, mapper));
         server.setExecutor(Executors.newCachedThreadPool());
         server.start();
         System.out.println("[worker] HTTP server started on port " + httpPort + " workerId=" + workerId);
@@ -74,7 +100,8 @@ public class WorkerMain {
                     for (Row row : rs) {
                         UUID jobId = row.getUuid("job_id");
                         Instant scheduledTime = row.getInstant("scheduled_time");
-                        processJob(session, lockClient, updateJobStatusStmt, insertHistoryStmt, updateHistoryEndStmt, bucketId, scheduledTime, jobId, workerId);
+                        processJob(session, lockClient, updateJobStatusStmt, insertHistoryStmt, updateHistoryEndStmt,
+                                bucketId, scheduledTime, jobId, workerId);
                         break; // process one then move to next bucket
                     }
                     Thread.sleep(pollIntervalMs);
@@ -92,15 +119,34 @@ public class WorkerMain {
         poller.start();
     }
 
+    private static void ensureKeyspace(CqlSession session, String keyspace) {
+        try {
+            ResultSet rs = session.execute(
+                    "SELECT keyspace_name FROM system_schema.keyspaces WHERE keyspace_name='" + keyspace + "'");
+            if (rs.one() == null) {
+                System.out.println("[worker] Keyspace '" + keyspace + "' not found. Creating...");
+                // SimpleStrategy for local dev; adjust for production
+                session.execute("CREATE KEYSPACE IF NOT EXISTS " + keyspace
+                        + " WITH replication = {'class':'SimpleStrategy','replication_factor':3}");
+                System.out.println("[worker] Keyspace created.");
+            } else {
+                System.out.println("[worker] Keyspace '" + keyspace + "' exists.");
+            }
+        } catch (Exception e) {
+            System.err.println("[worker] Failed checking/creating keyspace: " + e.getMessage());
+            e.printStackTrace();
+        }
+    }
+
     private static void processJob(CqlSession session,
-                                   LockClient lockClient,
-                                   PreparedStatement updateJobStatusStmt,
-                                   PreparedStatement insertHistoryStmt,
-                                   PreparedStatement updateHistoryEndStmt,
-                                   int bucketId,
-                                   Instant scheduledTime,
-                                   UUID jobId,
-                                   String workerId) {
+            LockClient lockClient,
+            PreparedStatement updateJobStatusStmt,
+            PreparedStatement insertHistoryStmt,
+            PreparedStatement updateHistoryEndStmt,
+            int bucketId,
+            Instant scheduledTime,
+            UUID jobId,
+            String workerId) {
         String resource = "job:" + jobId;
         Duration ttl = Duration.ofSeconds(30);
         LockResult lr = lockClient.acquire(resource, workerId, ttl, Duration.ofSeconds(5));
@@ -111,7 +157,7 @@ public class WorkerMain {
         UUID runId = UUID.randomUUID();
         Instant start = Instant.now();
         // Heartbeat thread to renew lock until finished
-        final boolean[] done = {false};
+        final boolean[] done = { false };
         Thread heartbeat = new Thread(() -> {
             while (!done[0]) {
                 try {
@@ -132,7 +178,8 @@ public class WorkerMain {
         heartbeat.setDaemon(true);
         try {
             // Initial history entry (end_at null)
-            session.execute(insertHistoryStmt.bind(jobId.toString(), runId, workerId, lr.getToken(), start, null, "running"));
+            session.execute(
+                    insertHistoryStmt.bind(jobId.toString(), runId, workerId, lr.getToken(), start, null, "running"));
             session.execute(updateJobStatusStmt.bind("running", bucketId, scheduledTime, jobId));
             heartbeat.start();
             // Simulated work (placeholder for actual payload handling)
@@ -150,7 +197,11 @@ public class WorkerMain {
             System.err.println("[worker] Job " + jobId + " failed: " + ex.getMessage());
         } finally {
             done[0] = true;
-            try { heartbeat.join(2000); } catch (InterruptedException ignored) { Thread.currentThread().interrupt(); }
+            try {
+                heartbeat.join(2000);
+            } catch (InterruptedException ignored) {
+                Thread.currentThread().interrupt();
+            }
             lockClient.release(resource, workerId, lr.getToken());
             jobsInProgress.decrementAndGet();
         }
@@ -162,9 +213,20 @@ public class WorkerMain {
     }
 
     private static void respond(HttpExchange exchange, int code, String body) throws IOException {
+        exchange.getResponseHeaders().set("Content-Type", "text/plain; charset=utf-8");
         exchange.sendResponseHeaders(code, body.getBytes().length);
         try (OutputStream os = exchange.getResponseBody()) {
             os.write(body.getBytes());
+        }
+    }
+
+    private static void respondJson(HttpExchange exchange, int code, Object value, ObjectMapper mapper)
+            throws IOException {
+        byte[] data = mapper.writeValueAsBytes(value);
+        exchange.getResponseHeaders().set("Content-Type", "application/json; charset=utf-8");
+        exchange.sendResponseHeaders(code, data.length);
+        try (OutputStream os = exchange.getResponseBody()) {
+            os.write(data);
         }
     }
 
@@ -188,28 +250,44 @@ public class WorkerMain {
         private final PreparedStatement insertJobStmt;
         private final PreparedStatement selectJobStmt;
         private final PreparedStatement enqueueJobStmt;
+        private final PreparedStatement selectHistoryByJobStmt;
         private final int buckets;
+        private final ObjectMapper mapper;
 
-        JobsHandler(CqlSession session, PreparedStatement insertJobStmt, PreparedStatement selectJobStmt, PreparedStatement enqueueJobStmt, int buckets) {
+        JobsHandler(CqlSession session, PreparedStatement insertJobStmt, PreparedStatement selectJobStmt,
+                PreparedStatement enqueueJobStmt, PreparedStatement selectHistoryByJobStmt, int buckets,
+                ObjectMapper mapper) {
             this.session = session;
             this.insertJobStmt = insertJobStmt;
             this.selectJobStmt = selectJobStmt;
             this.enqueueJobStmt = enqueueJobStmt;
+            this.selectHistoryByJobStmt = selectHistoryByJobStmt;
             this.buckets = buckets;
+            this.mapper = mapper;
         }
 
         @Override
         public void handle(HttpExchange exchange) throws IOException {
             if ("POST".equalsIgnoreCase(exchange.getRequestMethod())) {
-                UUID jobId = UUID.randomUUID();
-                Instant now = Instant.now();
-                // Minimal body handling (consume but ignore for now)
-                exchange.getRequestBody().close();
-                BoundStatement bs = insertJobStmt.bind(jobId.toString(), now.toString(), "{}", 3600, now);
-                session.execute(bs);
-                int bucket = Math.abs(jobId.hashCode()) % buckets;
-                session.execute(enqueueJobStmt.bind(bucket, Instant.now(), jobId, "{}"));
-                respond(exchange, 201, "{\"job_id\":\"" + jobId + "\"}\n");
+                try (InputStream is = exchange.getRequestBody()) {
+                    com.example.worker.api.JobCreateRequest req = mapper.readValue(is,
+                            com.example.worker.api.JobCreateRequest.class);
+                    UUID jobId = UUID.randomUUID();
+                    Instant now = Instant.now();
+                    String schedule = Optional.ofNullable(req.getSchedule()).orElse("immediate");
+                    int maxDur = Optional.ofNullable(req.getMaxDurationSeconds()).orElse(3600);
+                    Object payloadObj = Optional.ofNullable(req.getPayload()).orElse(new java.util.HashMap<>());
+                    String payloadJson = mapper.writeValueAsString(payloadObj);
+                    BoundStatement bs = insertJobStmt.bind(jobId.toString(), schedule, payloadJson, maxDur, now);
+                    session.execute(bs);
+                    int bucket = Math.abs(jobId.hashCode()) % buckets;
+                    session.execute(enqueueJobStmt.bind(bucket, Instant.now(), jobId, payloadJson));
+                    respondJson(exchange, 201, new com.example.worker.api.JobResponse(
+                            jobId.toString(), schedule, payloadObj, maxDur, now, "pending", null, null, null), mapper);
+                } catch (Exception ex) {
+                    respondJson(exchange, 400, new com.example.worker.api.ErrorResponse("bad_request", ex.getMessage()),
+                            mapper);
+                }
             } else if ("GET".equalsIgnoreCase(exchange.getRequestMethod())) {
                 URI uri = exchange.getRequestURI();
                 String path = uri.getPath();
@@ -217,16 +295,45 @@ public class WorkerMain {
                     String id = path.substring("/jobs/".length());
                     Row r = session.execute(selectJobStmt.bind(id)).one();
                     if (r == null) {
-                        respond(exchange, 404, "not found");
+                        respondJson(exchange, 404,
+                                new com.example.worker.api.ErrorResponse("not_found", "job " + id + " not found"),
+                                mapper);
                         return;
                     }
-                    String body = "{" + "\"job_id\":\"" + id + "\"}";
-                    respond(exchange, 200, body);
+                    String schedule = r.getString("schedule");
+                    String payloadStr = r.getString("payload");
+                    Object payloadObj = null;
+                    try {
+                        payloadObj = payloadStr == null ? null : mapper.readTree(payloadStr);
+                    } catch (Exception ignored) {
+                    }
+                    Integer maxDur = r.isNull("max_duration_seconds") ? null : r.getInt("max_duration_seconds");
+                    Instant createdAt = r.getInstant("created_at");
+                    // Status aggregation deferred (needs join/calc). For now unknown.
+                    // Aggregate latest run status
+                    ResultSet hrs = session.execute(selectHistoryByJobStmt.bind(id));
+                    Instant latestStart = null;
+                    Instant latestEnd = null;
+                    String latestRunStatus = null;
+                    for (Row hr : hrs) {
+                        Instant s = hr.getInstant("start_at");
+                        if (latestStart == null || (s != null && s.isAfter(latestStart))) {
+                            latestStart = s;
+                            latestEnd = hr.getInstant("end_at");
+                            latestRunStatus = hr.getString("status");
+                        }
+                    }
+                    String status = latestRunStatus; // if null => no runs yet
+                    respondJson(exchange, 200, new com.example.worker.api.JobResponse(id, schedule, payloadObj, maxDur,
+                            createdAt, status, latestStart, latestEnd, latestRunStatus), mapper);
                 } else {
-                    respond(exchange, 400, "Specify /jobs/{id}");
+                    respondJson(exchange, 400,
+                            new com.example.worker.api.ErrorResponse("bad_request", "Specify /jobs/{id}"), mapper);
                 }
             } else {
-                respond(exchange, 405, "Method Not Allowed");
+                respondJson(exchange, 405,
+                        new com.example.worker.api.ErrorResponse("method_not_allowed", exchange.getRequestMethod()),
+                        mapper);
             }
         }
     }
@@ -236,19 +343,23 @@ public class WorkerMain {
         private final PreparedStatement selectJobStmt;
         private final PreparedStatement enqueueJobStmt;
         private final int buckets;
+        private final ObjectMapper mapper;
 
-        JobActionHandler(CqlSession session, PreparedStatement selectJobStmt, PreparedStatement enqueueJobStmt, int buckets) {
+        JobActionHandler(CqlSession session, PreparedStatement selectJobStmt, PreparedStatement enqueueJobStmt,
+                int buckets, ObjectMapper mapper) {
             this.session = session;
             this.selectJobStmt = selectJobStmt;
             this.enqueueJobStmt = enqueueJobStmt;
             this.buckets = buckets;
+            this.mapper = mapper;
         }
 
         @Override
         public void handle(HttpExchange exchange) throws IOException {
             String path = exchange.getRequestURI().getPath();
             if (!path.startsWith("/jobs/")) {
-                respond(exchange, 404, "not found");
+                respondJson(exchange, 404, new com.example.worker.api.ErrorResponse("not_found", "invalid path"),
+                        mapper);
                 return;
             }
             String remainder = path.substring("/jobs/".length());
@@ -258,19 +369,22 @@ public class WorkerMain {
                 try {
                     jobId = UUID.fromString(id);
                 } catch (IllegalArgumentException ex) {
-                    respond(exchange, 400, "bad job id");
+                    respondJson(exchange, 400, new com.example.worker.api.ErrorResponse("bad_request", "bad job id"),
+                            mapper);
                     return;
                 }
                 Row r = session.execute(selectJobStmt.bind(id)).one();
                 if (r == null) {
-                    respond(exchange, 404, "not found");
+                    respondJson(exchange, 404,
+                            new com.example.worker.api.ErrorResponse("not_found", "job " + id + " not found"), mapper);
                     return;
                 }
                 int bucket = Math.abs(jobId.hashCode()) % buckets;
                 session.execute(enqueueJobStmt.bind(bucket, Instant.now(), jobId, "{}"));
-                respond(exchange, 200, "enqueued\n");
+                respondJson(exchange, 200, new com.example.worker.api.EnqueueResponse(id, "enqueued"), mapper);
             } else {
-                respond(exchange, 400, "unsupported action");
+                respondJson(exchange, 400,
+                        new com.example.worker.api.ErrorResponse("bad_request", "unsupported action"), mapper);
             }
         }
     }

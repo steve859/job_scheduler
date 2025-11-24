@@ -3,8 +3,7 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ROOT="${SCRIPT_DIR}/.."
 
-${SCRIPT_DIR}/start.sh
-${SCRIPT_DIR}/init_schema.sh
+
 
 echo "[smoke] Waiting for worker HTTP..."
 for i in $(seq 1 60); do

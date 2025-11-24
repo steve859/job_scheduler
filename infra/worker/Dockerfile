@@ -4,7 +4,7 @@
 ## otherwise keep container alive (useful while developing client-lib & infra).
 
 ## Multi-stage build producing worker.jar
-FROM eclipse-temurin:17-jdk-jammy AS build
+FROM maven:3.9.6-eclipse-temurin-17 AS build
 WORKDIR /workspace
 COPY . .
 RUN mvn -q -DskipTests -pl worker -am package
