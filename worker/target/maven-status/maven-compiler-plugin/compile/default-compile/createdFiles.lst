@@ -1,8 +1,4 @@
 com\example\worker\api\EnqueueResponse.class
-main\java\com\example\worker\WorkerMain$JobActionHandler.class
-main\java\com\example\worker\WorkerMain$JobsHandler.class
-main\java\com\example\worker\WorkerMain$MetricsHandler.class
 com\example\worker\api\JobResponse.class
-main\java\com\example\worker\WorkerMain.class
 com\example\worker\api\ErrorResponse.class
 com\example\worker\api\JobCreateRequest.class

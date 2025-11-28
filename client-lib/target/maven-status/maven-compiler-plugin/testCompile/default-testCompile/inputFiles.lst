@@ -1,1 +1,3 @@
 D:\Code\da1\job_scheduler\client-lib\src\test\java\com\example\AppTest.java
+D:\Code\da1\job_scheduler\client-lib\src\test\java\com\example\lock\LockSeqHiLoIT.java
+D:\Code\da1\job_scheduler\client-lib\src\test\java\com\example\lock\LockClientIT.java
