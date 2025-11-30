@@ -1,6 +1,8 @@
 package com.example.worker;
 
 import com.example.lock.LockClient;
+import com.example.lock.LockMetrics;
+import com.example.worker.metrics.PromLockMetrics;
 import com.example.lock.LockResult;
 import com.datastax.oss.driver.api.core.CqlSession;
 import com.datastax.oss.driver.api.core.cql.BoundStatement;
@@ -26,6 +28,8 @@ import com.fasterxml.jackson.datatype.jsr310.JavaTimeModule;
 import com.sun.net.httpserver.HttpExchange;
 import com.sun.net.httpserver.HttpHandler;
 import com.sun.net.httpserver.HttpServer;
+import io.prometheus.client.CollectorRegistry;
+import io.prometheus.client.exporter.common.TextFormat;
 
 public class WorkerMain {
     private static final int DEFAULT_BUCKETS = 16;
@@ -53,7 +57,10 @@ public class WorkerMain {
         // Switch to keyspace explicitly
         session.execute("USE " + keyspace);
 
-        LockClient lockClient = new LockClient(contactPoint, port, keyspace); // now keyspace exists
+        // Prometheus metrics registry and LockMetrics implementation
+        CollectorRegistry registry = CollectorRegistry.defaultRegistry;
+        LockMetrics metrics = new PromLockMetrics(registry);
+        LockClient lockClient = new LockClient(contactPoint, port, keyspace, localDc, metrics); // now keyspace exists
 
         PreparedStatement insertJobStmt = session.prepare(
                 "INSERT INTO jobs (job_id, schedule, payload, max_duration_seconds, created_at) VALUES (?, ?, ?, ?, ?) IF NOT EXISTS");
@@ -61,16 +68,18 @@ public class WorkerMain {
                 "SELECT job_id, schedule, payload, max_duration_seconds, created_at FROM jobs WHERE job_id = ?");
         PreparedStatement enqueueJobStmt = session.prepare(
                 "INSERT INTO jobs_sharded (bucket_id, scheduled_time, job_id, payload, status, attempts) VALUES (?, ?, ?, ?, 'pending', 0)");
+        PreparedStatement enqueuePendingStmt = session.prepare(
+                "INSERT INTO jobs_pending_by_bucket (bucket_id, scheduled_time, job_id, payload) VALUES (?, ?, ?, ?)");
         PreparedStatement updateJobStatusStmt = session.prepare(
                 "UPDATE jobs_sharded SET status = ? WHERE bucket_id = ? AND scheduled_time = ? AND job_id = ?");
+        PreparedStatement deletePendingStmt = session.prepare(
+                "DELETE FROM jobs_pending_by_bucket WHERE bucket_id = ? AND scheduled_time = ? AND job_id = ?");
         PreparedStatement insertHistoryStmt = session.prepare(
                 "INSERT INTO job_history (job_id, run_id, worker_id, fencing_token, start_at, end_at, status) VALUES (?, ?, ?, ?, ?, ?, ?) ");
         PreparedStatement updateHistoryEndStmt = session
                 .prepare("UPDATE job_history SET end_at = ?, status = ? WHERE job_id = ? AND run_id = ?");
-        // NOTE: Filtering on non-primary-key column 'status' requires ALLOW FILTERING.
-        // For production: replace with materialized view or a separate pending table.
-        PreparedStatement selectDueStmt = session.prepare(
-                "SELECT bucket_id, scheduled_time, job_id, payload, status, attempts FROM jobs_sharded WHERE bucket_id = ? AND status = 'pending' LIMIT 32 ALLOW FILTERING");
+        PreparedStatement selectDuePendingStmt = session.prepare(
+                "SELECT bucket_id, scheduled_time, job_id, payload FROM jobs_pending_by_bucket WHERE bucket_id = ? AND scheduled_time <= ? LIMIT 32");
         PreparedStatement selectHistoryByJobStmt = session.prepare(
                 "SELECT run_id, start_at, end_at, status FROM job_history WHERE job_id = ?");
 
@@ -81,11 +90,12 @@ public class WorkerMain {
 
         HttpServer server = HttpServer.create(new InetSocketAddress(httpPort), 0);
         server.createContext("/healthz", exchange -> respond(exchange, 200, "OK"));
-        server.createContext("/metrics", new MetricsHandler());
+        server.createContext("/metrics", new MetricsHandlerProm(registry));
         server.createContext("/jobs", new JobsHandler(session, insertJobStmt, selectJobStmt, enqueueJobStmt,
-                selectHistoryByJobStmt, buckets, mapper));
+                enqueuePendingStmt, selectHistoryByJobStmt, buckets, mapper));
         server.createContext("/jobs/run", exchange -> respond(exchange, 400, "Specify /jobs/{id}/run"));
-        server.createContext("/jobs/", new JobActionHandler(session, selectJobStmt, enqueueJobStmt, buckets, mapper));
+        server.createContext("/jobs/",
+                new JobActionHandler(session, selectJobStmt, enqueueJobStmt, enqueuePendingStmt, buckets, mapper));
         server.setExecutor(Executors.newCachedThreadPool());
         server.start();
         System.out.println("[worker] HTTP server started on port " + httpPort + " workerId=" + workerId);
@@ -96,11 +106,12 @@ public class WorkerMain {
             while (true) {
                 int bucketId = bucketCursor++ % buckets;
                 try {
-                    ResultSet rs = session.execute(selectDueStmt.bind(bucketId));
+                    ResultSet rs = session.execute(selectDuePendingStmt.bind(bucketId, Instant.now()));
                     for (Row row : rs) {
                         UUID jobId = row.getUuid("job_id");
                         Instant scheduledTime = row.getInstant("scheduled_time");
-                        processJob(session, lockClient, updateJobStatusStmt, insertHistoryStmt, updateHistoryEndStmt,
+                        processJob(session, lockClient, updateJobStatusStmt, deletePendingStmt, insertHistoryStmt,
+                                updateHistoryEndStmt,
                                 bucketId, scheduledTime, jobId, workerId);
                         break; // process one then move to next bucket
                     }
@@ -141,6 +152,7 @@ public class WorkerMain {
     private static void processJob(CqlSession session,
             LockClient lockClient,
             PreparedStatement updateJobStatusStmt,
+            PreparedStatement deletePendingStmt,
             PreparedStatement insertHistoryStmt,
             PreparedStatement updateHistoryEndStmt,
             int bucketId,
@@ -154,6 +166,11 @@ public class WorkerMain {
             return; // skip if cannot acquire
         }
         jobsInProgress.incrementAndGet();
+        // Remove from pending queue to avoid duplicate pickup
+        try {
+            session.execute(deletePendingStmt.bind(bucketId, scheduledTime, jobId));
+        } catch (Exception ignored) {
+        }
         UUID runId = UUID.randomUUID();
         Instant start = Instant.now();
         // Heartbeat thread to renew lock until finished
@@ -230,18 +247,37 @@ public class WorkerMain {
         }
     }
 
-    static class MetricsHandler implements HttpHandler {
+    static class MetricsHandlerProm implements HttpHandler {
+        private final CollectorRegistry registry;
+
+        MetricsHandlerProm(CollectorRegistry registry) {
+            this.registry = registry;
+        }
+
         @Override
         public void handle(HttpExchange exchange) throws IOException {
-            StringBuilder sb = new StringBuilder();
-            sb.append("# HELP jobs_processed_total Total jobs processed\n");
-            sb.append("# TYPE jobs_processed_total counter\n");
-            sb.append("jobs_processed_total{status=\"success\"} ").append(jobsProcessedSuccess.get()).append('\n');
-            sb.append("jobs_processed_total{status=\"failed\"} ").append(jobsProcessedFailed.get()).append('\n');
-            sb.append("# HELP jobs_in_progress Current jobs in progress\n");
-            sb.append("# TYPE jobs_in_progress gauge\n");
-            sb.append("jobs_in_progress ").append(jobsInProgress.get()).append('\n');
-            respond(exchange, 200, sb.toString());
+            exchange.getResponseHeaders().set("Content-Type", TextFormat.CONTENT_TYPE_004);
+            // augment custom gauges/counters via a simple text block
+            StringBuilder custom = new StringBuilder();
+            custom.append("# HELP jobs_processed_total Total jobs processed\n");
+            custom.append("# TYPE jobs_processed_total counter\n");
+            custom.append("jobs_processed_total{status=\"success\"} ").append(jobsProcessedSuccess.get()).append('\n');
+            custom.append("jobs_processed_total{status=\"failed\"} ").append(jobsProcessedFailed.get()).append('\n');
+            custom.append("# HELP jobs_in_progress Current jobs in progress\n");
+            custom.append("# TYPE jobs_in_progress gauge\n");
+            custom.append("jobs_in_progress ").append(jobsInProgress.get()).append('\n');
+
+            // write Prometheus registry metrics then our custom block
+            StringBuilder body = new StringBuilder();
+            java.io.StringWriter writer = new java.io.StringWriter();
+            TextFormat.write004(writer, registry.metricFamilySamples());
+            body.append(writer.toString());
+            body.append(custom.toString());
+            byte[] data = body.toString().getBytes();
+            exchange.sendResponseHeaders(200, data.length);
+            try (OutputStream os = exchange.getResponseBody()) {
+                os.write(data);
+            }
         }
     }
 
@@ -250,17 +286,20 @@ public class WorkerMain {
         private final PreparedStatement insertJobStmt;
         private final PreparedStatement selectJobStmt;
         private final PreparedStatement enqueueJobStmt;
+        private final PreparedStatement enqueuePendingStmt;
         private final PreparedStatement selectHistoryByJobStmt;
         private final int buckets;
         private final ObjectMapper mapper;
 
         JobsHandler(CqlSession session, PreparedStatement insertJobStmt, PreparedStatement selectJobStmt,
-                PreparedStatement enqueueJobStmt, PreparedStatement selectHistoryByJobStmt, int buckets,
+                PreparedStatement enqueueJobStmt, PreparedStatement enqueuePendingStmt,
+                PreparedStatement selectHistoryByJobStmt, int buckets,
                 ObjectMapper mapper) {
             this.session = session;
             this.insertJobStmt = insertJobStmt;
             this.selectJobStmt = selectJobStmt;
             this.enqueueJobStmt = enqueueJobStmt;
+            this.enqueuePendingStmt = enqueuePendingStmt;
             this.selectHistoryByJobStmt = selectHistoryByJobStmt;
             this.buckets = buckets;
             this.mapper = mapper;
@@ -281,7 +320,9 @@ public class WorkerMain {
                     BoundStatement bs = insertJobStmt.bind(jobId.toString(), schedule, payloadJson, maxDur, now);
                     session.execute(bs);
                     int bucket = Math.abs(jobId.hashCode()) % buckets;
-                    session.execute(enqueueJobStmt.bind(bucket, Instant.now(), jobId, payloadJson));
+                    Instant when = Instant.now();
+                    session.execute(enqueueJobStmt.bind(bucket, when, jobId, payloadJson));
+                    session.execute(enqueuePendingStmt.bind(bucket, when, jobId, payloadJson));
                     respondJson(exchange, 201, new com.example.worker.api.JobResponse(
                             jobId.toString(), schedule, payloadObj, maxDur, now, "pending", null, null, null), mapper);
                 } catch (Exception ex) {
@@ -342,14 +383,16 @@ public class WorkerMain {
         private final CqlSession session;
         private final PreparedStatement selectJobStmt;
         private final PreparedStatement enqueueJobStmt;
+        private final PreparedStatement enqueuePendingStmt;
         private final int buckets;
         private final ObjectMapper mapper;
 
         JobActionHandler(CqlSession session, PreparedStatement selectJobStmt, PreparedStatement enqueueJobStmt,
-                int buckets, ObjectMapper mapper) {
+                PreparedStatement enqueuePendingStmt, int buckets, ObjectMapper mapper) {
             this.session = session;
             this.selectJobStmt = selectJobStmt;
             this.enqueueJobStmt = enqueueJobStmt;
+            this.enqueuePendingStmt = enqueuePendingStmt;
             this.buckets = buckets;
             this.mapper = mapper;
         }
@@ -380,7 +423,9 @@ public class WorkerMain {
                     return;
                 }
                 int bucket = Math.abs(jobId.hashCode()) % buckets;
-                session.execute(enqueueJobStmt.bind(bucket, Instant.now(), jobId, "{}"));
+                Instant when = Instant.now();
+                session.execute(enqueueJobStmt.bind(bucket, when, jobId, "{}"));
+                session.execute(enqueuePendingStmt.bind(bucket, when, jobId, "{}"));
                 respondJson(exchange, 200, new com.example.worker.api.EnqueueResponse(id, "enqueued"), mapper);
             } else {
                 respondJson(exchange, 400,

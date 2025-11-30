@@ -61,6 +61,16 @@ CREATE TABLE IF NOT EXISTS lock_seq (
 );
 
 /* =====================================================================
+    Lock sequence sharded to reduce contention (Phase 1 optimization path)
+    ===================================================================== */
+CREATE TABLE IF NOT EXISTS lock_seq_shard (
+   resource text,
+   shard_id int,
+   last_seq bigint,
+   PRIMARY KEY ((resource), shard_id)
+);
+
+/* =====================================================================
    SHARDED SEQUENCE FOR HOT RESOURCES (resource hashed to shard_id)
    ===================================================================== */
 CREATE TABLE IF NOT EXISTS lock_seq_shard (
@@ -85,6 +95,19 @@ CREATE TABLE IF NOT EXISTS jobs_sharded (
   attempts int,
   PRIMARY KEY ((bucket_id), scheduled_time, job_id)
 ) WITH default_time_to_live = 0;  /* explicit; jobs cleaned by process */
+
+/* =====================================================================
+    PENDING QUEUE VIEW PER BUCKET (to avoid ALLOW FILTERING)
+    - Enqueue writes here and jobs_sharded
+    - Pollers read from here (<= now) and delete when starting
+    ===================================================================== */
+CREATE TABLE IF NOT EXISTS jobs_pending_by_bucket (
+   bucket_id int,
+   scheduled_time timestamp,
+   job_id uuid,
+   payload text,
+   PRIMARY KEY ((bucket_id), scheduled_time, job_id)
+);
 
 /* =====================================================================
    MIGRATION NOTES

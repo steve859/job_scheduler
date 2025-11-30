@@ -1,1 +1,3 @@
+com\example\lock\LockClientIT.class
 com\example\AppTest.class
+com\example\lock\LockClientIT$1CountingMetrics.class
