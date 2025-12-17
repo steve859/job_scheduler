@@ -53,6 +53,17 @@ CREATE TABLE IF NOT EXISTS locks (
   AND gc_grace_seconds = 60;
 
 /* =====================================================================
+    Dead Letter Queue for failed jobs
+    ===================================================================== */
+CREATE TABLE IF NOT EXISTS jobs_dlq (
+   job_id uuid PRIMARY KEY,
+   attempts int,
+   last_error text,
+   last_attempt_at timestamp,
+   payload text
+);
+
+/* =====================================================================
    SEQUENCE (UNSHARDED) - MAY BE PHASED OUT BY SHARDED SEQ
    ===================================================================== */
 CREATE TABLE IF NOT EXISTS lock_seq (

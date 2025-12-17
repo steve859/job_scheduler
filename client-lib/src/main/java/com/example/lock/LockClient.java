@@ -112,10 +112,14 @@ public class LockClient implements AutoCloseable {
             if (irow != null && irow.getBoolean("[applied]")) {
                 long start = 1L;
                 long end = seqBlockSize;
-                seqBlocks.put(resource, new Block(start, end));
-                return start++;
+                Block nb = new Block(start, end);
+                seqBlocks.put(resource, nb);
+                long v = nb.next;
+                nb.next++;
+                return v;
             }
-
+            // Try to allocate a block via CAS update; loop until success (no read-only
+            // fallback)
             for (int attempt = 0; attempt < maxRetries; attempt++) {
                 long t1 = System.nanoTime();
                 Row current = session.execute(selectLockSeqStmt.bind(resource)).one();
@@ -128,32 +132,36 @@ public class LockClient implements AutoCloseable {
                 if (urow != null && urow.getBoolean("[applied]")) {
                     long start = old + 1;
                     long end = nextLast;
-                    seqBlocks.put(resource, new Block(start, end));
-                    return start++;
+                    Block nb = new Block(start, end);
+                    seqBlocks.put(resource, nb);
+                    long v = nb.next;
+                    nb.next++;
+                    return v;
                 }
                 // contention -> backoff and retry
                 sleepBackoffWithJitter(retryBackoff.toMillis());
             }
-            // As a last resort, fall back to 1-by-1 increment (degraded mode)
-            for (int attempt = 0; attempt < maxRetries; attempt++) {
-                long t2 = System.nanoTime();
+            // If we failed to allocate after retries, keep backing off until success
+            while (true) {
+                long t1 = System.nanoTime();
                 Row current = session.execute(selectLockSeqStmt.bind(resource)).one();
                 long old = (current == null || current.isNull("last_seq")) ? 0L : current.getLong("last_seq");
-                long next = old + 1;
-                BoundStatement upd1 = updateLockSeqIfStmt.bind(next, resource, old);
-                ResultSet r2 = session.execute(upd1);
-                metrics.observeLwtLatencySeconds("next_seq.fallback.update",
-                        (System.nanoTime() - t2) / 1_000_000_000.0);
-                Row r2row = r2.one();
-                if (r2row != null && r2row.getBoolean("[applied]")) {
-                    return next;
+                long nextLast = old + seqBlockSize;
+                BoundStatement upd = updateLockSeqIfStmt.bind(nextLast, resource, old);
+                ResultSet ur = session.execute(upd);
+                metrics.observeLwtLatencySeconds("next_seq.block.update", (System.nanoTime() - t1) / 1_000_000_000.0);
+                Row urow = ur.one();
+                if (urow != null && urow.getBoolean("[applied]")) {
+                    long start = old + 1;
+                    long end = nextLast;
+                    Block nb = new Block(start, end);
+                    seqBlocks.put(resource, nb);
+                    long v = nb.next;
+                    nb.next++;
+                    return v;
                 }
-                sleepBackoffWithJitter(retryBackoff.toMillis());
+                sleepBackoffWithJitter(Math.min(200, retryBackoff.toMillis()));
             }
-            // final read-only fallback (not strictly monotonic under extreme race)
-            Row finalRow = session.execute(selectLockSeqStmt.bind(resource)).one();
-            long finalVal = (finalRow == null || finalRow.isNull("last_seq")) ? 1L : finalRow.getLong("last_seq") + 1;
-            return finalVal;
         }
     }
 

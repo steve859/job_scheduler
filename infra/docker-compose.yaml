@@ -115,53 +115,53 @@ services:
     depends_on:
       cassandra1:
         condition: service_healthy
-    volumes:
-      - ./prometheus:/etc/prometheus:ro
+
+  postgres:
+    image: postgres:15
+    container_name: postgres
+    environment:
+      - POSTGRES_DB=orders
+      - POSTGRES_USER=app
+      - POSTGRES_PASSWORD=app
     ports:
-      - "9090:9090"
-    depends_on:
-      - cassandra1
+      - "5432:5432"
+    volumes:
+      - pg_data:/var/lib/postgresql/data
+      - ./postgres/init.sql:/docker-entrypoint-initdb.d/init.sql:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U app -d orders || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 30
     networks:
       - cass_net
 
-  grafana:
-    image: grafana/grafana:latest
-    container_name: grafana
-    ports:
-      - "3000:3000"
-    depends_on:
-      - prometheus
-    networks:
-      - cass_net
-    volumes:
-      - grafana_data:/var/lib/grafana
-
-  worker:
+  orders:
     build:
       context: ..
-      dockerfile: infra/worker/Dockerfile
-    container_name: worker1
+    container_name: orders
     environment:
-      - CASSANDRA_CONTACT_POINT=cassandra1
-      - CASSANDRA_PORT=9042
-      - CASSANDRA_KEYSPACE=scheduler
-      - WORKER_ID=worker1
-      - WORKER_HTTP_PORT=8080
-      - WORKER_POLL_INTERVAL_MS=1500
-      - WORKER_BUCKETS=16
+      - PG_HOST=postgres
+      - PG_PORT=5432
+      - PG_DB=orders
+      - PG_USER=app
+      - PG_PASSWORD=app
+      - ORDERS_HTTP_PORT=8081
     ports:
-      - "8080:8080"
+      - "8081:8081"
     depends_on:
-      cassandra1:
+      postgres:
         condition: service_healthy
     networks:
       - cass_net
+
 
 volumes:
   cass1_data:
   cass2_data:
   cass3_data:
   grafana_data:
+  pg_data:
 
 networks:
   cass_net:

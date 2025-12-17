@@ -202,3 +202,9 @@ Performance Tests
 Low contention: p50 < X ms (tự đặt mục tiêu).
 
 High contention: đo throughput và p99 latency.
+
+7. Phase 2 Progress (2025-11-28)
+- Worker metrics extended: `jobs_processed_total{status}`, `jobs_in_progress`, `job_duration_seconds` histogram.
+- Prometheus endpoint serves only registry-backed metrics to avoid duplication.
+- Starter Grafana dashboard JSON added at `infra/grafana/dashboards/job_scheduler_overview.json`.
+- Minimal Java benchmark `com.example.lock.ClientBench` to measure throughput and p95/p99 (sampled) for acquires.

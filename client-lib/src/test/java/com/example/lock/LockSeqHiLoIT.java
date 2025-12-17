@@ -34,6 +34,8 @@ public class LockSeqHiLoIT {
                     "CREATE KEYSPACE IF NOT EXISTS scheduler WITH replication = {'class': 'SimpleStrategy', 'replication_factor': 1}");
             session.execute("USE scheduler");
             session.execute("CREATE TABLE IF NOT EXISTS lock_seq (resource text PRIMARY KEY, last_seq bigint)");
+            session.execute(
+                    "CREATE TABLE IF NOT EXISTS locks (resource_id text PRIMARY KEY, holder text, fencing_token bigint, expire_at timestamp, epoch bigint, metadata map<text,text>)");
         }
     }
 
@@ -44,7 +46,7 @@ public class LockSeqHiLoIT {
     }
 
     private static LockClient newClient() {
-        return new LockClient(cass.getHost(), cass.getFirstMappedPort(), "scheduler");
+        return new LockClient(cass.getHost(), cass.getFirstMappedPort(), "scheduler", "datacenter1");
     }
 
     @Test

@@ -30,12 +30,23 @@ import com.sun.net.httpserver.HttpHandler;
 import com.sun.net.httpserver.HttpServer;
 import io.prometheus.client.CollectorRegistry;
 import io.prometheus.client.exporter.common.TextFormat;
+import io.prometheus.client.Counter;
+import io.prometheus.client.Gauge;
+import io.prometheus.client.Histogram;
 
 public class WorkerMain {
     private static final int DEFAULT_BUCKETS = 16;
     private static final AtomicLong jobsProcessedSuccess = new AtomicLong();
     private static final AtomicLong jobsProcessedFailed = new AtomicLong();
     private static final AtomicLong jobsInProgress = new AtomicLong();
+    private static volatile boolean ready = false;
+    private static volatile boolean shuttingDown = false;
+
+    // Prometheus metrics (registered at runtime in main)
+    private static Counter jobsProcessedTotal;
+    private static Gauge jobsInProgressGauge;
+    private static Histogram jobDurationSeconds;
+    private static Counter jobsDlqTotal;
 
     public static void main(String[] args) throws Exception {
         String contactPoint = env("CASSANDRA_CONTACT_POINT", "127.0.0.1");
@@ -46,20 +57,47 @@ public class WorkerMain {
         int pollIntervalMs = Integer.parseInt(env("WORKER_POLL_INTERVAL_MS", "2000"));
         int buckets = Integer.parseInt(env("WORKER_BUCKETS", String.valueOf(DEFAULT_BUCKETS)));
         String localDc = env("CASS_LOCAL_DC", "DC1");
+        int maxInProgress = Integer.parseInt(env("WORKER_MAX_IN_PROGRESS", "32"));
 
         // Build session WITHOUT keyspace first to allow auto-create if missing
-        CqlSession session = CqlSession.builder()
+        CqlSession bootstrap = CqlSession.builder()
                 .addContactPoint(new InetSocketAddress(contactPoint, port))
                 .withLocalDatacenter(localDc)
                 .build();
 
-        ensureKeyspace(session, keyspace);
-        // Switch to keyspace explicitly
-        session.execute("USE " + keyspace);
+        ensureKeyspace(bootstrap, keyspace);
+        bootstrap.close();
+
+        // Rebuild session bound to keyspace to avoid runtime keyspace change warnings
+        CqlSession session = CqlSession.builder()
+                .addContactPoint(new InetSocketAddress(contactPoint, port))
+                .withLocalDatacenter(localDc)
+                .withKeyspace(keyspace)
+                .build();
 
         // Prometheus metrics registry and LockMetrics implementation
         CollectorRegistry registry = CollectorRegistry.defaultRegistry;
         LockMetrics metrics = new PromLockMetrics(registry);
+
+        // Register worker metrics
+        jobsProcessedTotal = Counter.build()
+                .name("jobs_processed_total")
+                .help("Total jobs processed by status")
+                .labelNames("status")
+                .register(registry);
+        jobsInProgressGauge = Gauge.build()
+                .name("jobs_in_progress")
+                .help("Current jobs in progress")
+                .register(registry);
+        jobDurationSeconds = Histogram.build()
+                .name("job_duration_seconds")
+                .help("Job execution duration in seconds")
+                .buckets(0.05, 0.1, 0.25, 0.5, 1, 2, 5, 10, 30, 60)
+                .register(registry);
+        jobsDlqTotal = Counter.build()
+                .name("jobs_dlq_total")
+                .help("Total jobs moved to DLQ")
+                .register(registry);
         LockClient lockClient = new LockClient(contactPoint, port, keyspace, localDc, metrics); // now keyspace exists
 
         PreparedStatement insertJobStmt = session.prepare(
@@ -74,6 +112,12 @@ public class WorkerMain {
                 "UPDATE jobs_sharded SET status = ? WHERE bucket_id = ? AND scheduled_time = ? AND job_id = ?");
         PreparedStatement deletePendingStmt = session.prepare(
                 "DELETE FROM jobs_pending_by_bucket WHERE bucket_id = ? AND scheduled_time = ? AND job_id = ?");
+        PreparedStatement selectJobShardedStmt = session.prepare(
+                "SELECT attempts, payload FROM jobs_sharded WHERE bucket_id = ? AND scheduled_time = ? AND job_id = ?");
+        PreparedStatement updateAttemptsStmt = session.prepare(
+                "UPDATE jobs_sharded SET attempts = ?, status = ? WHERE bucket_id = ? AND scheduled_time = ? AND job_id = ?");
+        PreparedStatement insertDlqStmt = session.prepare(
+                "INSERT INTO jobs_dlq (job_id, attempts, last_error, last_attempt_at, payload) VALUES (?, ?, ?, ?, ?)");
         PreparedStatement insertHistoryStmt = session.prepare(
                 "INSERT INTO job_history (job_id, run_id, worker_id, fencing_token, start_at, end_at, status) VALUES (?, ?, ?, ?, ?, ?, ?) ");
         PreparedStatement updateHistoryEndStmt = session
@@ -89,7 +133,17 @@ public class WorkerMain {
         mapper.disable(SerializationFeature.WRITE_DATES_AS_TIMESTAMPS);
 
         HttpServer server = HttpServer.create(new InetSocketAddress(httpPort), 0);
-        server.createContext("/healthz", exchange -> respond(exchange, 200, "OK"));
+        server.createContext("/healthz", exchange -> {
+            int code = 200;
+            try {
+                session.execute("SELECT now() FROM system.local");
+            } catch (Exception e) {
+                code = 503;
+            }
+            respond(exchange, code, code == 200 ? "OK" : "UNHEALTHY");
+        });
+        server.createContext("/readyz",
+                exchange -> respond(exchange, ready ? 200 : 503, ready ? "READY" : "NOT_READY"));
         server.createContext("/metrics", new MetricsHandlerProm(registry));
         server.createContext("/jobs", new JobsHandler(session, insertJobStmt, selectJobStmt, enqueueJobStmt,
                 enqueuePendingStmt, selectHistoryByJobStmt, buckets, mapper));
@@ -104,14 +158,24 @@ public class WorkerMain {
         Thread poller = new Thread(() -> {
             int bucketCursor = 0;
             while (true) {
+                if (shuttingDown)
+                    break;
                 int bucketId = bucketCursor++ % buckets;
                 try {
+                    if (jobsInProgress.get() >= maxInProgress) {
+                        Thread.sleep(Math.min(pollIntervalMs, 500));
+                        continue;
+                    }
                     ResultSet rs = session.execute(selectDuePendingStmt.bind(bucketId, Instant.now()));
                     for (Row row : rs) {
+                        if (jobsInProgress.get() >= maxInProgress) {
+                            break;
+                        }
                         UUID jobId = row.getUuid("job_id");
                         Instant scheduledTime = row.getInstant("scheduled_time");
                         processJob(session, lockClient, updateJobStatusStmt, deletePendingStmt, insertHistoryStmt,
-                                updateHistoryEndStmt,
+                                updateHistoryEndStmt, selectJobShardedStmt, updateAttemptsStmt, enqueuePendingStmt,
+                                insertDlqStmt,
                                 bucketId, scheduledTime, jobId, workerId);
                         break; // process one then move to next bucket
                     }
@@ -128,6 +192,35 @@ public class WorkerMain {
         });
         poller.setDaemon(true);
         poller.start();
+        ready = true;
+
+        // Graceful shutdown hook: stop polling, wait for in-flight jobs
+        Runtime.getRuntime().addShutdownHook(new Thread(() -> {
+            System.out.println("[worker] Shutdown initiated");
+            shuttingDown = true;
+            try {
+                poller.join(5000);
+            } catch (InterruptedException ignored) {
+                Thread.currentThread().interrupt();
+            }
+            long waitStart = System.currentTimeMillis();
+            while (jobsInProgress.get() > 0 && System.currentTimeMillis() - waitStart < 30000) {
+                try {
+                    Thread.sleep(250);
+                } catch (InterruptedException ignored) {
+                    Thread.currentThread().interrupt();
+                }
+            }
+            try {
+                session.close();
+            } catch (Exception ignored) {
+            }
+            try {
+                server.stop(1);
+            } catch (Exception ignored) {
+            }
+            System.out.println("[worker] Shutdown complete");
+        }));
     }
 
     private static void ensureKeyspace(CqlSession session, String keyspace) {
@@ -155,6 +248,10 @@ public class WorkerMain {
             PreparedStatement deletePendingStmt,
             PreparedStatement insertHistoryStmt,
             PreparedStatement updateHistoryEndStmt,
+            PreparedStatement selectJobShardedStmt,
+            PreparedStatement updateAttemptsStmt,
+            PreparedStatement enqueuePendingStmt,
+            PreparedStatement insertDlqStmt,
             int bucketId,
             Instant scheduledTime,
             UUID jobId,
@@ -166,6 +263,7 @@ public class WorkerMain {
             return; // skip if cannot acquire
         }
         jobsInProgress.incrementAndGet();
+        jobsInProgressGauge.inc();
         // Remove from pending queue to avoid duplicate pickup
         try {
             session.execute(deletePendingStmt.bind(bucketId, scheduledTime, jobId));
@@ -206,12 +304,41 @@ public class WorkerMain {
             session.execute(updateHistoryEndStmt.bind(end, "completed", jobId.toString(), runId));
             session.execute(updateJobStatusStmt.bind("completed", bucketId, scheduledTime, jobId));
             jobsProcessedSuccess.incrementAndGet();
+            jobsProcessedTotal.labels("success").inc();
+            jobDurationSeconds.observe((end.toEpochMilli() - start.toEpochMilli()) / 1000.0);
         } catch (Exception ex) {
             Instant end = Instant.now();
             session.execute(updateHistoryEndStmt.bind(end, "failed", jobId.toString(), runId));
             session.execute(updateJobStatusStmt.bind("failed", bucketId, scheduledTime, jobId));
             jobsProcessedFailed.incrementAndGet();
+            jobsProcessedTotal.labels("failed").inc();
+            jobDurationSeconds.observe((end.toEpochMilli() - start.toEpochMilli()) / 1000.0);
             System.err.println("[worker] Job " + jobId + " failed: " + ex.getMessage());
+
+            // Retry / DLQ logic
+            try {
+                Row jr = session.execute(selectJobShardedStmt.bind(bucketId, scheduledTime, jobId)).one();
+                int attempts = (jr == null || jr.isNull("attempts")) ? 0 : jr.getInt("attempts");
+                String payload = (jr == null || jr.isNull("payload")) ? "{}" : jr.getString("payload");
+                int maxAttempts = Integer.parseInt(env("WORKER_MAX_ATTEMPTS", "3"));
+                long baseMs = Long.parseLong(env("WORKER_BACKOFF_BASE_MS", "1000"));
+                long maxDelayMs = Long.parseLong(env("WORKER_BACKOFF_MAX_MS", "60000"));
+                if (attempts + 1 <= maxAttempts) {
+                    long delay = Math.min(maxDelayMs, (long) (baseMs * Math.pow(2, attempts)));
+                    // jitter ±20%
+                    double jitter = 0.8 + (Math.random() * 0.4);
+                    long nextDelay = (long) (delay * jitter);
+                    Instant nextTime = Instant.now().plusMillis(nextDelay);
+                    session.execute(updateAttemptsStmt.bind(attempts + 1, "pending", bucketId, scheduledTime, jobId));
+                    session.execute(enqueuePendingStmt.bind(bucketId, nextTime, jobId, payload));
+                } else {
+                    session.execute(insertDlqStmt.bind(jobId, attempts, ex.getMessage(), Instant.now(), payload));
+                    session.execute(updateJobStatusStmt.bind("dlq", bucketId, scheduledTime, jobId));
+                    jobsDlqTotal.inc();
+                }
+            } catch (Exception re) {
+                System.err.println("[worker] Retry/DLQ handling error: " + re.getMessage());
+            }
         } finally {
             done[0] = true;
             try {
@@ -221,6 +348,7 @@ public class WorkerMain {
             }
             lockClient.release(resource, workerId, lr.getToken());
             jobsInProgress.decrementAndGet();
+            jobsInProgressGauge.dec();
         }
     }
 
@@ -257,23 +385,9 @@ public class WorkerMain {
         @Override
         public void handle(HttpExchange exchange) throws IOException {
             exchange.getResponseHeaders().set("Content-Type", TextFormat.CONTENT_TYPE_004);
-            // augment custom gauges/counters via a simple text block
-            StringBuilder custom = new StringBuilder();
-            custom.append("# HELP jobs_processed_total Total jobs processed\n");
-            custom.append("# TYPE jobs_processed_total counter\n");
-            custom.append("jobs_processed_total{status=\"success\"} ").append(jobsProcessedSuccess.get()).append('\n');
-            custom.append("jobs_processed_total{status=\"failed\"} ").append(jobsProcessedFailed.get()).append('\n');
-            custom.append("# HELP jobs_in_progress Current jobs in progress\n");
-            custom.append("# TYPE jobs_in_progress gauge\n");
-            custom.append("jobs_in_progress ").append(jobsInProgress.get()).append('\n');
-
-            // write Prometheus registry metrics then our custom block
-            StringBuilder body = new StringBuilder();
             java.io.StringWriter writer = new java.io.StringWriter();
             TextFormat.write004(writer, registry.metricFamilySamples());
-            body.append(writer.toString());
-            body.append(custom.toString());
-            byte[] data = body.toString().getBytes();
+            byte[] data = writer.toString().getBytes();
             exchange.sendResponseHeaders(200, data.length);
             try (OutputStream os = exchange.getResponseBody()) {
                 os.write(data);
