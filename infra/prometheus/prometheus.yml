@@ -8,7 +8,7 @@ scrape_configs:
 
   - job_name: "workers"
     static_configs:
-      - targets: ["worker1:8080"] # placeholder; worker exporter port when implemented
+      - targets: ["worker:8080"]
 
   - job_name: "cassandra"
     static_configs:

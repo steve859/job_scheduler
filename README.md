@@ -8,6 +8,7 @@ This project provides a distributed job scheduler backed by Apache Cassandra usi
 - `worker/`: Worker HTTP service + polling loop.
 - `infra/`: Docker Compose stack (3-node Cassandra, Prometheus, Grafana, worker) and schema.
 - `scripts/`: Helper scripts for starting stack, applying schema, smoke test.
+ - `orders/`: Phase 3 Orders checkout + idempotency + optimistic inventory locking (Postgres)
 
 ## Quick Start
 Prerequisites: Docker, Bash (Git Bash on Windows or WSL), Java 17, Maven.
@@ -49,7 +50,9 @@ Stop stack:
 - `GET /jobs/{id}` -> fetch job (minimal response)
 - `POST /jobs/{id}/run` -> enqueue job into `jobs_sharded`
 - `GET /metrics` -> Prometheus metrics
-- `GET /healthz` -> health check
+- `GET /healthz` -> health check (queries Cassandra; returns 503 if unhealthy)
+- `GET /readyz` -> readiness gate (returns READY once server and poller initialized)
+ - `POST /checkout` (orders service): create or return existing order via idempotency key; performs inventory optimistic lock.
 
 ## Locking Semantics
 Fencing tokens are generated via CAS on `lock_seq`. Lock acquisition stores `fencing_token` and `expire_at`. Expired locks are taken over by incrementing `epoch` (CAS on `epoch`). Clients use their token to ensure ordered execution.
@@ -62,7 +65,21 @@ Prometheus scrapes:
 - Worker metrics (`worker1:8080/metrics`)
 - Cassandra exporters (placeholder ports)
 
-Grafana container starts with persistent volume `grafana_data`.
+Worker metrics (Phase 2/3):
+- `jobs_processed_total{status}`: total jobs processed by status (success/failed)
+- `jobs_in_progress`: current running jobs
+- `job_duration_seconds`: histogram of job execution time
+- Lock metrics include LWT latency histogram and operation counters
+- `jobs_dlq_total`: total jobs moved to DLQ
+
+Grafana:
+- Container starts with persistent volume `grafana_data`.
+- Import the starter dashboard JSON at `infra/grafana/dashboards/job_scheduler_overview.json` to visualize throughput, durations, lock LWT latency, DLQ insert rate, and in-progress cap.
+
+Suggested alerts:
+- DLQ spike: `sum(rate(jobs_dlq_total[5m])) > 0.5` for 10m
+- Lock LWT latency: `histogram_quantile(0.99, sum(rate(lock_lwt_latency_seconds_bucket[5m])) by (le)) > 0.5`s for 10m
+- Saturation: `jobs_in_progress` near `WORKER_MAX_IN_PROGRESS` for sustained 10m
 
 ## Common Issues
 | Issue | Cause | Fix |
@@ -81,6 +98,63 @@ Run worker locally (without Docker):
 ```bash
 java -jar worker/target/worker-1.0-SNAPSHOT.jar
 ```
+
+### Phase 3 Runtime Hardening
+Endpoints:
+- `/readyz` indicates readiness after session, HTTP server, and poller init.
+- `/healthz` performs a lightweight Cassandra query; returns 503 if not healthy.
+
+Graceful shutdown:
+- The worker stops polling and drains in-flight jobs (up to 30s), then closes the session and HTTP server.
+
+Backpressure:
+- Global cap via `WORKER_MAX_IN_PROGRESS` (default `32`). Poller pauses when in-progress reaches the cap.
+
+Env vars:
+- `WORKER_MAX_ATTEMPTS` (default `3`): max retry attempts before DLQ.
+- `WORKER_BACKOFF_BASE_MS` (default `1000`): base backoff in ms.
+- `WORKER_BACKOFF_MAX_MS` (default `60000`): max backoff cap in ms.
+- `WORKER_MAX_IN_PROGRESS` (default `32`): max concurrently running jobs.
+
+### Phase 3 Orders & Postgres
+Postgres (service `postgres`) added via Compose with auto-init script `infra/postgres/init.sql` providing:
+- Tables: `inventory`, `orders`, `order_items`, `payments`, `idempotency_keys`.
+- Seed SKUs: `SKU-RED-TSHIRT`, `SKU-BLUE-TSHIRT`.
+
+Orders service (`orders/`):
+- Endpoint `POST /checkout` expects JSON:
+	`{ "idempotencyKey": "KEY-123", "userId": "u1", "items": [{"sku":"SKU-RED-TSHIRT","qty":1,"priceCents":1999}] }`
+- Idempotency: first request inserts key; subsequent identical requests return the existing `orderId`.
+- Inventory reservation uses optimistic locking (`version` column) preventing oversell.
+- Failure responses: `409 insufficient_inventory`, `409 inventory_conflict`, `409 idempotency_conflict`.
+
+Orders env vars:
+- `PG_HOST` (default `localhost`)
+- `PG_PORT` (default `5432`)
+- `PG_DB` (default `orders`)
+- `PG_USER` (default `app`)
+- `PG_PASSWORD` (default `app`)
+- `ORDERS_HTTP_PORT` (default `8081`)
+
+Run Orders locally:
+```bash
+mvn -q -pl orders -am package
+java -cp orders/target/orders-1.0-SNAPSHOT.jar com.example.orders.OrdersMain
+```
+Sample checkout:
+```bash
+curl -X POST http://localhost:8081/checkout \
+	-H 'Content-Type: application/json' \
+	-d '{"idempotencyKey":"KEY-123","userId":"u1","items":[{"sku":"SKU-RED-TSHIRT","qty":1,"priceCents":1999}]}'
+```
+
+### Simple Lock Benchmark (Phase 2)
+Run a minimal concurrent benchmark against a Cassandra endpoint:
+```bash
+mvn -q -pl client-lib -am -DskipTests package
+java -cp client-lib/target/client-lib-1.0-SNAPSHOT.jar com.example.lock.ClientBench
+```
+Env vars (optional): `CASS_CONTACT`, `CASS_PORT`, `CASS_KEYSPACE`, `THREADS`, `DURATION_SECONDS`, `TTL_SECONDS`, `RESOURCE_PREFIX`.
 
 ## Smoke Test Validation
 `scripts/smoke_test.sh` ensures:

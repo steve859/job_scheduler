@@ -2,4 +2,6 @@ D:\Code\da1\job_scheduler\client-lib\src\main\java\com\example\lock\ClientSmoke.
 D:\Code\da1\job_scheduler\client-lib\src\main\java\com\example\App.java
 D:\Code\da1\job_scheduler\client-lib\src\main\java\com\example\lock\LockClient.java
 D:\Code\da1\job_scheduler\client-lib\src\main\java\com\example\lock\LockResult.java
+D:\Code\da1\job_scheduler\client-lib\src\main\java\com\example\lock\LockMetrics.java
 D:\Code\da1\job_scheduler\client-lib\src\main\java\com\example\worker\JobPoller.java
+D:\Code\da1\job_scheduler\client-lib\src\main\java\com\example\lock\ClientBench.java

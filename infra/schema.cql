@@ -53,11 +53,32 @@ CREATE TABLE IF NOT EXISTS locks (
   AND gc_grace_seconds = 60;
 
 /* =====================================================================
+    Dead Letter Queue for failed jobs
+    ===================================================================== */
+CREATE TABLE IF NOT EXISTS jobs_dlq (
+   job_id uuid PRIMARY KEY,
+   attempts int,
+   last_error text,
+   last_attempt_at timestamp,
+   payload text
+);
+
+/* =====================================================================
    SEQUENCE (UNSHARDED) - MAY BE PHASED OUT BY SHARDED SEQ
    ===================================================================== */
 CREATE TABLE IF NOT EXISTS lock_seq (
   resource text PRIMARY KEY,
   last_seq bigint
+);
+
+/* =====================================================================
+    Lock sequence sharded to reduce contention (Phase 1 optimization path)
+    ===================================================================== */
+CREATE TABLE IF NOT EXISTS lock_seq_shard (
+   resource text,
+   shard_id int,
+   last_seq bigint,
+   PRIMARY KEY ((resource), shard_id)
 );
 
 /* =====================================================================
@@ -85,6 +106,19 @@ CREATE TABLE IF NOT EXISTS jobs_sharded (
   attempts int,
   PRIMARY KEY ((bucket_id), scheduled_time, job_id)
 ) WITH default_time_to_live = 0;  /* explicit; jobs cleaned by process */
+
+/* =====================================================================
+    PENDING QUEUE VIEW PER BUCKET (to avoid ALLOW FILTERING)
+    - Enqueue writes here and jobs_sharded
+    - Pollers read from here (<= now) and delete when starting
+    ===================================================================== */
+CREATE TABLE IF NOT EXISTS jobs_pending_by_bucket (
+   bucket_id int,
+   scheduled_time timestamp,
+   job_id uuid,
+   payload text,
+   PRIMARY KEY ((bucket_id), scheduled_time, job_id)
+);
 
 /* =====================================================================
    MIGRATION NOTES

@@ -1,0 +1,78 @@
+{
+  "title": "Job Scheduler Overview",
+  "uid": "jobsched-overview",
+  "schemaVersion": 39,
+  "version": 1,
+  "timezone": "browser",
+  "editable": true,
+  "panels": [
+    {
+      "type": "stat",
+      "title": "Jobs In Progress",
+      "gridPos": {"x": 0, "y": 0, "w": 6, "h": 4},
+      "targets": [
+        {"expr": "jobs_in_progress", "legendFormat": "in_progress", "refId": "A"}
+      ]
+    },
+    {
+      "type": "timeseries",
+      "title": "Jobs Processed (by status)",
+      "gridPos": {"x": 6, "y": 0, "w": 18, "h": 8},
+      "targets": [
+        {"expr": "rate(jobs_processed_total{status=\"success\"}[5m])", "legendFormat": "success", "refId": "A"},
+        {"expr": "rate(jobs_processed_total{status=\"failed\"}[5m])", "legendFormat": "failed", "refId": "B"}
+      ]
+    },
+    {
+      "type": "timeseries",
+      "title": "Job Duration p95/p99",
+      "gridPos": {"x": 0, "y": 8, "w": 12, "h": 8},
+      "targets": [
+        {
+          "expr": "histogram_quantile(0.95, sum(rate(job_duration_seconds_bucket[5m])) by (le))",
+          "legendFormat": "p95", "refId": "A"
+        },
+        {
+          "expr": "histogram_quantile(0.99, sum(rate(job_duration_seconds_bucket[5m])) by (le))",
+          "legendFormat": "p99", "refId": "B"
+        }
+      ]
+    },
+    {
+      "type": "timeseries",
+      "title": "LWT Latency (p95/p99)",
+      "gridPos": {"x": 12, "y": 8, "w": 12, "h": 8},
+      "targets": [
+        {
+          "expr": "histogram_quantile(0.95, sum(rate(lock_lwt_latency_seconds_bucket[5m])) by (le))",
+          "legendFormat": "p95", "refId": "A"
+        },
+        {
+          "expr": "histogram_quantile(0.99, sum(rate(lock_lwt_latency_seconds_bucket[5m])) by (le))",
+          "legendFormat": "p99", "refId": "B"
+        }
+      ]
+    }
+    ,
+    {
+      "type": "timeseries",
+      "title": "DLQ Insert Rate",
+      "gridPos": {"x": 0, "y": 16, "w": 12, "h": 6},
+      "targets": [
+        {"expr": "sum(rate(jobs_dlq_total[5m]))", "legendFormat": "dlq_rate", "refId": "A"}
+      ]
+    },
+    {
+      "type": "stat",
+      "title": "Current In-Progress Cap",
+      "gridPos": {"x": 12, "y": 16, "w": 12, "h": 6},
+      "targets": [
+        {"expr": "jobs_in_progress", "legendFormat": "in_progress", "refId": "A"}
+      ],
+      "description": "Compare with WORKER_MAX_IN_PROGRESS"
+    }
+  ],
+  "templating": {"list": []},
+  "annotations": {"list": []},
+  "time": {"from": "now-6h", "to": "now"}
+}
