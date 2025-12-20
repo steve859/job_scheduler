@@ -1,7 +1,9 @@
 package com.example.orders.service;
 
 import com.example.orders.domain.Order;
+import com.example.orders.domain.OrderItem;
 import com.example.orders.dto.request.OrderCreateRequest;
+import com.example.orders.dto.request.OrderItemRequest;
 import com.example.orders.dto.request.OrderUpdateRequest;
 import com.example.orders.dto.response.OrderResponse;
 import com.example.orders.exception.IdempotencyKeyConflictException;
@@ -13,6 +15,7 @@ import lombok.extern.slf4j.Slf4j;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
 
+import java.math.BigDecimal;
 import java.util.List;
 
 @Service
@@ -30,6 +33,12 @@ public class OrderServiceImpl implements OrderService {
             throw new IdempotencyKeyConflictException(request.getIdempotencyKey());
         }
         Order newOrder = orderMapper.toOrder(request);
+        BigDecimal totalAmount = BigDecimal.ZERO;
+        for(OrderItemRequest orderItemRequest: request.getItems()) {
+            totalAmount = totalAmount.add(orderItemRequest.getPrice().multiply(BigDecimal.valueOf(orderItemRequest.getQuantity())));
+        }
+        newOrder.setTotalAmount(totalAmount);
+        newOrder.onCreate();
         return orderMapper.toOrderResponse(orderRepository.save(newOrder));
     }
 
