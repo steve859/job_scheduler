@@ -1,5 +1,9 @@
 # Job Scheduler (Cassandra LWT + Distributed Locks)
 
+Quick navigation:
+- `docs/status.md` (where you are / what to run next)
+- `docs/plan.md` (original roadmap)
+
 ## Overview
 This project provides a distributed job scheduler backed by Apache Cassandra using lightweight transactions (LWT) for safe, fencing-token based locking. A worker service exposes REST endpoints to create and run jobs and a background loop processes pending jobs while emitting Prometheus metrics.
 
@@ -23,16 +27,45 @@ Verify containers:
 docker ps
 ```
 
-### Create & Run a Job
+### Create & Run a Job (via Scheduler API)
 ```bash
-curl -X POST http://localhost:8080/jobs -d '{"schedule":"now","payload":"{}","max_duration_seconds":60}' -H 'Content-Type: application/json'
+curl -X POST http://localhost:8082/jobs -d '{"schedule":"now","payload":{},"max_duration_seconds":60}' -H 'Content-Type: application/json'
 # => {"job_id":"<UUID>"}
-curl -X POST http://localhost:8080/jobs/<UUID>/run
+curl -X POST http://localhost:8082/jobs/<UUID>/run
+```
+
+### Delayed Jobs
+Run once at a specific time or after a delay:
+```bash
+# Run at a specific instant
+curl -X POST http://localhost:8082/jobs \
+	-H 'Content-Type: application/json' \
+	-d '{"runAt":"2026-01-17T10:00:00Z","payload":{},"max_duration_seconds":60}'
+
+# Run after N seconds
+curl -X POST http://localhost:8082/jobs \
+	-H 'Content-Type: application/json' \
+	-d '{"delaySeconds":30,"payload":{},"max_duration_seconds":60}'
+```
+
+### Cron Jobs (recurring)
+Create a cron job (UNIX 5-field cron) and let scheduler enqueue occurrences automatically:
+```bash
+curl -X POST http://localhost:8082/cronjobs \
+	-H 'Content-Type: application/json' \
+	-d '{"cron":"*/1 * * * *","timezone":"UTC","payload":{},"max_duration_seconds":60,"enabled":true}'
+
+# Get cron job
+curl http://localhost:8082/cronjobs/<CRON_ID>
+
+# Delete cron job
+curl -X DELETE http://localhost:8082/cronjobs/<CRON_ID>
 ```
 
 Check metrics:
 ```bash
 curl http://localhost:8080/metrics
+curl http://localhost:8082/metrics
 ```
 
 Smoke test end-to-end:

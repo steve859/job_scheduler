@@ -4,9 +4,9 @@ import com.fasterxml.jackson.databind.ObjectMapper;
 import com.fasterxml.jackson.datatype.jsr310.JavaTimeModule;
 import com.zaxxer.hikari.HikariConfig;
 import com.zaxxer.hikari.HikariDataSource;
-import org.junit.AfterClass;
-import org.junit.BeforeClass;
-import org.junit.Test;
+import org.junit.jupiter.api.AfterAll;
+import org.junit.jupiter.api.BeforeAll;
+import org.junit.jupiter.api.Test;
 import org.testcontainers.containers.PostgreSQLContainer;
 
 import java.net.InetSocketAddress;
@@ -20,7 +20,8 @@ import java.util.concurrent.ExecutionException;
 import com.sun.net.httpserver.HttpServer;
 
 import static org.hamcrest.CoreMatchers.*;
-import static org.junit.Assert.*;
+import static org.hamcrest.MatcherAssert.assertThat;
+import static org.junit.jupiter.api.Assertions.assertTrue;
 
 public class OrdersIT {
     private static PostgreSQLContainer<?> pg;
@@ -28,7 +29,7 @@ public class OrdersIT {
     private static HttpServer server;
     private static int port;
 
-    @BeforeClass
+    @BeforeAll
     public static void setup() throws Exception {
         pg = new PostgreSQLContainer<>("postgres:15").withInitScript("init.sql");
         pg.start();
@@ -47,7 +48,7 @@ public class OrdersIT {
         port = server.getAddress().getPort();
     }
 
-    @AfterClass
+    @AfterAll
     public static void teardown() {
         if (server != null)
             server.stop(0);
@@ -102,7 +103,7 @@ public class OrdersIT {
         // One should succeed (201), the other should conflict (409)
         boolean ok201 = r1.statusCode() == 201 || r2.statusCode() == 201;
         boolean conflict409 = r1.statusCode() == 409 || r2.statusCode() == 409;
-        assertTrue("expect one 201 and one 409, got: " + r1.statusCode() + ", " + r2.statusCode(),
-                ok201 && conflict409);
+        assertTrue(ok201 && conflict409,
+                "expect one 201 and one 409, got: " + r1.statusCode() + ", " + r2.statusCode());
     }
 }

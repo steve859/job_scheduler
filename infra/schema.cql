@@ -82,16 +82,6 @@ CREATE TABLE IF NOT EXISTS lock_seq_shard (
 );
 
 /* =====================================================================
-   SHARDED SEQUENCE FOR HOT RESOURCES (resource hashed to shard_id)
-   ===================================================================== */
-CREATE TABLE IF NOT EXISTS lock_seq_shard (
-  resource text,
-  shard_id int,
-  last_seq bigint,
-  PRIMARY KEY ((resource), shard_id)
-);
-
-/* =====================================================================
    SHARDED JOB QUEUE (AP LAYER)
    Partition: bucket_id; clustering for priority: scheduled_time then job_id
    status: pending|running|completed|failed|canceled
@@ -118,6 +108,32 @@ CREATE TABLE IF NOT EXISTS jobs_pending_by_bucket (
    job_id uuid,
    payload text,
    PRIMARY KEY ((bucket_id), scheduled_time, job_id)
+);
+
+/* =====================================================================
+    CRON JOBS (PHASE 4 - Scheduler)
+    ---------------------------------------------------------------------
+    - cron_jobs stores definition and next_run_at
+    - cron_pending_by_bucket allows range scan (next_run_at <= now) per bucket
+    ===================================================================== */
+CREATE TABLE IF NOT EXISTS cron_jobs (
+   cron_id uuid PRIMARY KEY,
+   cron_expr text,
+   timezone text,
+   payload text,
+   max_duration_seconds int,
+   enabled boolean,
+   bucket_id int,
+   next_run_at timestamp,
+   created_at timestamp,
+   updated_at timestamp
+);
+
+CREATE TABLE IF NOT EXISTS cron_pending_by_bucket (
+   bucket_id int,
+   next_run_at timestamp,
+   cron_id uuid,
+   PRIMARY KEY ((bucket_id), next_run_at, cron_id)
 );
 
 /* =====================================================================
