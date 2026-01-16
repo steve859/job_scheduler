@@ -2,6 +2,7 @@
 
 Quick navigation:
 - `docs/status.md` (where you are / what to run next)
+- `docs/phase_tracker.md` (phase checklist)
 - `docs/plan.md` (original roadmap)
 
 ## Overview
@@ -27,10 +28,13 @@ Verify containers:
 docker ps
 ```
 
+## OpenAPI
+OpenAPI spec (Scheduler service): [docs/openapi/scheduler.yaml](docs/openapi/scheduler.yaml)
+
 ### Create & Run a Job (via Scheduler API)
 ```bash
-curl -X POST http://localhost:8082/jobs -d '{"schedule":"now","payload":{},"max_duration_seconds":60}' -H 'Content-Type: application/json'
-# => {"job_id":"<UUID>"}
+curl -X POST http://localhost:8082/jobs -d '{"schedule":"now","payload":{},"maxDurationSeconds":60}' -H 'Content-Type: application/json'
+# => {"jobId":"<UUID>", ...}
 curl -X POST http://localhost:8082/jobs/<UUID>/run
 ```
 
@@ -40,12 +44,12 @@ Run once at a specific time or after a delay:
 # Run at a specific instant
 curl -X POST http://localhost:8082/jobs \
 	-H 'Content-Type: application/json' \
-	-d '{"runAt":"2026-01-17T10:00:00Z","payload":{},"max_duration_seconds":60}'
+	-d '{"runAt":"2026-01-17T10:00:00Z","payload":{},"maxDurationSeconds":60}'
 
 # Run after N seconds
 curl -X POST http://localhost:8082/jobs \
 	-H 'Content-Type: application/json' \
-	-d '{"delaySeconds":30,"payload":{},"max_duration_seconds":60}'
+	-d '{"delaySeconds":30,"payload":{},"maxDurationSeconds":60}'
 ```
 
 ### Cron Jobs (recurring)
@@ -53,7 +57,7 @@ Create a cron job (UNIX 5-field cron) and let scheduler enqueue occurrences auto
 ```bash
 curl -X POST http://localhost:8082/cronjobs \
 	-H 'Content-Type: application/json' \
-	-d '{"cron":"*/1 * * * *","timezone":"UTC","payload":{},"max_duration_seconds":60,"enabled":true}'
+	-d '{"cron":"*/1 * * * *","timezone":"UTC","payload":{},"maxDurationSeconds":60,"enabled":true}'
 
 # Get cron job
 curl http://localhost:8082/cronjobs/<CRON_ID>
@@ -71,6 +75,24 @@ curl http://localhost:8082/metrics
 Smoke test end-to-end:
 ```bash
 ./scripts/smoke_test.sh
+```
+
+### E2E demo flow (Scheduler → Worker)
+1) Create an immediate job:
+```bash
+curl -s -X POST http://localhost:8082/jobs \
+	-H 'Content-Type: application/json' \
+	-d '{"payload":{},"maxDurationSeconds":60}'
+# Copy the returned jobId into JOB_ID
+JOB_ID=<UUID>
+```
+2) Enqueue run-now:
+```bash
+curl -s -X POST http://localhost:8082/jobs/$JOB_ID/run
+```
+3) Verify worker processed it (poll until `lastRunStatus` becomes `success` or `failed`):
+```bash
+curl -s http://localhost:8082/jobs/$JOB_ID
 ```
 
 Stop stack:
@@ -95,8 +117,16 @@ Fencing tokens are generated via CAS on `lock_seq`. Lock acquisition stores `fen
 
 ## Prometheus & Grafana
 Prometheus scrapes:
-- Worker metrics (`worker1:8080/metrics`)
+- Worker metrics (`worker:8080/metrics`)
+- Scheduler metrics (`scheduler:8082/metrics`)
 - Cassandra exporters (placeholder ports)
+
+Alerting:
+- Prometheus loads alert rules from `infra/prometheus/alerts.yml`.
+- Alertmanager UI: `http://localhost:9093`
+- AIOps webhook service (MVP): `http://localhost:8085`
+	- List reports: `GET /reports`
+	- View report: `GET /reports/{id}`
 
 Worker metrics (Phase 2/3):
 - `jobs_processed_total{status}`: total jobs processed by status (success/failed)
@@ -111,7 +141,7 @@ Grafana:
 
 Suggested alerts:
 - DLQ spike: `sum(rate(jobs_dlq_total[5m])) > 0.5` for 10m
-- Lock LWT latency: `histogram_quantile(0.99, sum(rate(lock_lwt_latency_seconds_bucket[5m])) by (le)) > 0.5`s for 10m
+- Lock LWT latency: `histogram_quantile(0.99, sum(rate(lwt_latency_seconds_bucket[5m])) by (le, op)) > 0.25` for 10m
 - Saturation: `jobs_in_progress` near `WORKER_MAX_IN_PROGRESS` for sustained 10m
 
 ## Common Issues

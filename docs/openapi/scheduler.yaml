@@ -1,0 +1,330 @@
+openapi: 3.0.3
+info:
+  title: Job Scheduler - Scheduler API
+  version: 1.0.0
+  description: |
+    Scheduler service API for creating jobs (immediate/delayed), querying status (via job_history),
+    enqueueing runs, and managing cron jobs.
+servers:
+  - url: http://localhost:8082
+paths:
+  /healthz:
+    get:
+      summary: Liveness check
+      responses:
+        '200': { description: OK }
+        '503': { description: Unhealthy }
+  /readyz:
+    get:
+      summary: Readiness check
+      responses:
+        '200': { description: READY }
+        '503': { description: NOT_READY }
+  /metrics:
+    get:
+      summary: Prometheus metrics
+      responses:
+        '200':
+          description: Prometheus exposition format
+          content:
+            text/plain:
+              schema:
+                type: string
+  /jobs:
+    post:
+      summary: Create a job (immediate, delayed, or scheduled)
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/JobCreateRequest'
+            examples:
+              immediate:
+                value:
+                  payload: {}
+                  maxDurationSeconds: 60
+              runAt:
+                value:
+                  runAt: '2026-01-17T10:00:00Z'
+                  payload: {}
+                  maxDurationSeconds: 60
+              delay:
+                value:
+                  delaySeconds: 30
+                  payload: {}
+                  maxDurationSeconds: 60
+      responses:
+        '201':
+          description: Created
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/JobResponse'
+        '400':
+          description: Bad request
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '500':
+          description: Internal error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+  /jobs/{id}:
+    get:
+      summary: Get job details (includes last run from job_history)
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: string
+            format: uuid
+      responses:
+        '200':
+          description: Job
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/JobResponse'
+        '404':
+          description: Not found
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+  /jobs/{id}/run:
+    post:
+      summary: Enqueue a run-now for an existing job
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: string
+            format: uuid
+      responses:
+        '200':
+          description: Enqueued
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/EnqueueResponse'
+        '400':
+          description: Bad request
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '404':
+          description: Not found
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '405':
+          description: Method not allowed
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+  /cronjobs:
+    post:
+      summary: Create a cron job (UNIX 5-field cron)
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CronJobCreateRequest'
+            examples:
+              everyMinute:
+                value:
+                  cron: '*/1 * * * *'
+                  timezone: 'UTC'
+                  payload: {}
+                  maxDurationSeconds: 60
+                  enabled: true
+      responses:
+        '201':
+          description: Created
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/CronJobResponse'
+        '400':
+          description: Bad request
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '500':
+          description: Internal error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+  /cronjobs/{id}:
+    get:
+      summary: Get a cron job
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: string
+            format: uuid
+      responses:
+        '200':
+          description: Cron job
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/CronJobResponse'
+        '404':
+          description: Not found
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+    delete:
+      summary: Delete a cron job
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: string
+            format: uuid
+      responses:
+        '200':
+          description: Deleted
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/EnqueueResponse'
+        '400':
+          description: Bad request
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '405':
+          description: Method not allowed
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+components:
+  schemas:
+    ErrorResponse:
+      type: object
+      properties:
+        error:
+          type: string
+        detail:
+          type: string
+    EnqueueResponse:
+      type: object
+      properties:
+        jobId:
+          type: string
+        status:
+          type: string
+    JobCreateRequest:
+      type: object
+      description: |
+        Provide exactly one of: schedule, runAt, delaySeconds.
+        - schedule: 'now'/'immediate' or ISO-8601 Instant
+        - runAt: ISO-8601 Instant
+        - delaySeconds: integer seconds from now
+      properties:
+        schedule:
+          type: string
+        runAt:
+          type: string
+          format: date-time
+        delaySeconds:
+          type: integer
+          format: int64
+          minimum: 0
+        payload:
+          type: object
+          additionalProperties: true
+        maxDurationSeconds:
+          type: integer
+          minimum: 1
+          maximum: 86400
+      additionalProperties: false
+    JobResponse:
+      type: object
+      properties:
+        jobId:
+          type: string
+          format: uuid
+        schedule:
+          type: string
+        payload:
+          type: object
+          additionalProperties: true
+        maxDurationSeconds:
+          type: integer
+        createdAt:
+          type: string
+          format: date-time
+        status:
+          type: string
+        lastRunStartAt:
+          type: string
+          format: date-time
+        lastRunEndAt:
+          type: string
+          format: date-time
+        lastRunStatus:
+          type: string
+    CronJobCreateRequest:
+      type: object
+      properties:
+        cron:
+          type: string
+          description: UNIX 5-field cron expression
+        timezone:
+          type: string
+          description: IANA timezone (defaults to UTC)
+        payload:
+          type: object
+          additionalProperties: true
+        maxDurationSeconds:
+          type: integer
+          minimum: 1
+          maximum: 86400
+        enabled:
+          type: boolean
+      required: [cron]
+      additionalProperties: false
+    CronJobResponse:
+      type: object
+      properties:
+        cronId:
+          type: string
+          format: uuid
+        cron:
+          type: string
+        timezone:
+          type: string
+        payload:
+          type: object
+          additionalProperties: true
+        maxDurationSeconds:
+          type: integer
+        enabled:
+          type: boolean
+        nextRunAt:
+          type: string
+          format: date-time
+        createdAt:
+          type: string
+          format: date-time

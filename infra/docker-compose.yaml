@@ -80,12 +80,43 @@ services:
     container_name: prometheus
     volumes:
       - ./prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - ./prometheus/alerts.yml:/etc/prometheus/alerts.yml:ro
     ports:
       - "9090:9090"
     networks:
       - cass_net
     depends_on:
       - cassandra1
+
+  alertmanager:
+    image: prom/alertmanager:latest
+    container_name: alertmanager
+    volumes:
+      - ./alertmanager/alertmanager.yml:/etc/alertmanager/alertmanager.yml:ro
+    ports:
+      - "9093:9093"
+    networks:
+      - cass_net
+    depends_on:
+      - prometheus
+
+  aiops:
+    build:
+      context: ..
+      dockerfile: infra/aiops/Dockerfile
+    container_name: aiops
+    environment:
+      - AIOPS_HTTP_PORT=8085
+      - AIOPS_DATA_DIR=/data
+      - PROMETHEUS_BASE_URL=http://prometheus:9090
+    ports:
+      - "8085:8085"
+    volumes:
+      - aiops_data:/data
+    networks:
+      - cass_net
+    depends_on:
+      - prometheus
   grafana:
     image: grafana/grafana:latest
     container_name: grafana
@@ -180,6 +211,7 @@ volumes:
   cass3_data:
   grafana_data:
   pg_data:
+  aiops_data:
 
 networks:
   cass_net:

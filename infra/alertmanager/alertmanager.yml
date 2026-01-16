@@ -1,0 +1,15 @@
+global:
+  resolve_timeout: 5m
+
+route:
+  receiver: aiops-webhook
+  group_by: [alertname, component]
+  group_wait: 10s
+  group_interval: 1m
+  repeat_interval: 30m
+
+receivers:
+  - name: aiops-webhook
+    webhook_configs:
+      - url: http://aiops:8085/webhook/alertmanager
+        send_resolved: true

@@ -2,19 +2,21 @@
 
 This file is a short “where am I?” map for the repo.
 
+See also: `docs/phase_tracker.md` (tracker theo Phase 0–7).
+
 ## Where you are now
-- Current phase in the roadmap: **PHASE 3** (Orders + Inventory).
-- What’s solid already: distributed locks (Phase 1), scheduler worker + queue semantics (Phase 2), infra/metrics (Phase 0/2), and Orders checkout fundamentals (Phase 3).
+- Current phase in the roadmap: **PHASE 5** (Observability + Alerting + AIOps MVP).
+- What’s solid already: distributed locks (Phase 1), worker queue semantics + metrics (Phase 2/3), scheduler API + delayed/cron (Phase 4), and now Alertmanager + initial alert rules + AIOps webhook (Phase 5).
 
 ## Roadmap (phases)
 - Phase 0: Infra & foundation (Compose, schemas, CI).
 - Phase 1: Cassandra LWT distributed lock client (fencing tokens, takeover, renew/release) + IT.
 - Phase 2: Job scheduler queue + worker (polling, retries/backoff+jitter, DLQ, REST API, metrics).
-- Phase 3: Orders + Inventory business flow (idempotent checkout, reserve inventory safely, enqueue payment job).
-- Phase 4: Payment orchestration (idempotent payment, at-most-once execution, order → PAID, trigger fulfilment).
-- Phase 5: Fulfilment + notification (shipping/notification workers + outbox).
-- Phase 6: Observability + alerting + tracing + RCA.
-- Phase 7: Hardening/security/scale/chaos/canary.
+- Phase 3: Domain flow extensions (e.g., orders/inventory) if you choose to demo it.
+- Phase 4: Scheduler API & system integration (separate scheduler service, delayed/cron, compose wiring).
+- Phase 5: Observability + alerting + AIOps (Alertmanager + rules + RCA loop).
+- Phase 6: Benchmarking + chaos testing + optimization.
+- Phase 7: Documentation + hardening/security/scale.
 
 ## What exists in this repo (mental model)
 - `client-lib/`: Cassandra lock client + integration tests.
@@ -28,12 +30,13 @@ This file is a short “where am I?” map for the repo.
 - Phase 0: Compose + schemas + CI pipeline.
 - Phase 1: `LockClient` with LWT + fencing tokens + takeover, with Testcontainers IT.
 - Phase 2: worker queueing/polling + retry/backoff + DLQ + metrics/dashboard.
-- Phase 3 (partial): Orders checkout with idempotency + optimistic locking + passing IT.
+- Phase 4 (done): Scheduler service + API submit/query/run + delayed + cron + Prometheus scrape.
+- Phase 5 (partial): Alertmanager wiring + initial alerts + AIOps webhook (MVP).
 
 ### Still missing (🟡 / next)
-- Phase 3: either extract a separate InventoryService API, or keep it in-process but document the decision.
-- Phase 3→4 bridge: formalize the **payment job payload contract** and make enqueue robust (retry/metrics).
-- Phase 4: actual payment worker + payment idempotency + order status transitions.
+- Phase 5: log aggregation (Loki/ELK) and/or tracing (OpenTelemetry).
+- Phase 5: richer RCA: link to dashboards, attach runbooks, correlate with deploy/version.
+- Phase 6: benchmark suite + chaos scripts + report artifacts.
 
 ## Quick “confidence checks” (run these)
 All commands assume repo root: `d:\Code\da1\job_scheduler`.
@@ -60,10 +63,16 @@ mvn -q -pl client-lib verify
 ## Primary endpoints (today)
 - Worker: `http://localhost:8080`
   - `GET /healthz`, `GET /readyz`, `GET /metrics`
+  - Executes jobs from Cassandra queue
+- Scheduler: `http://localhost:8082`
+  - `GET /healthz`, `GET /readyz`, `GET /metrics`
   - `POST /jobs`, `GET /jobs/{id}`, `POST /jobs/{id}/run`
+- Prometheus: `http://localhost:9090`
+- Alertmanager: `http://localhost:9093`
+- AIOps (MVP): `http://localhost:8085`
 - Orders: `http://localhost:8081`
   - `POST /checkout`
 
 ## Recommended next step (pick one)
-1) **Finish Phase 3 “as spec”**: implement a separate InventoryService and call it from Orders.
-2) **Start Phase 4**: implement PaymentWorker using a `payment:{orderId}` lock + idempotency in Postgres; update order → PAID; enqueue fulfilment.
+1) **Complete Phase 5**: add Loki (logs) and wire Prometheus alerts → AIOps with richer context.
+2) **Start Phase 6**: add benchmark harness + chaos scripts (kill cassandra/worker) + report.
