@@ -1,0 +1,57 @@
+groups:
+  - name: job_scheduler.rules
+    rules:
+      - alert: JobDlqSpike
+        expr: sum(rate(jobs_dlq_total[5m])) > 0.5
+        for: 10m
+        labels:
+          severity: page
+          component: worker
+        annotations:
+          summary: "DLQ rate is high"
+          description: "jobs_dlq_total is increasing quickly (possible failures or downstream outage)."
+          promql: "sum(rate(jobs_dlq_total[5m]))"
+
+      - alert: WorkerSaturated
+        expr: max(jobs_in_progress) >= 30
+        for: 5m
+        labels:
+          severity: warn
+          component: worker
+        annotations:
+          summary: "Worker is saturated"
+          description: "jobs_in_progress is near the default cap (32). Throughput may degrade and schedules may lag."
+          promql: "max(jobs_in_progress)"
+
+      - alert: LockRenewFailures
+        expr: sum(rate(lock_renew_failure_total[5m])) > 0
+        for: 5m
+        labels:
+          severity: warn
+          component: lock
+        annotations:
+          summary: "Lock renew failures detected"
+          description: "Workers are failing to renew leases. This can cause aborts or lock churn."
+          promql: "sum(rate(lock_renew_failure_total[5m]))"
+
+      - alert: LwtLatencyP99High
+        expr: histogram_quantile(0.99, sum(rate(lwt_latency_seconds_bucket[5m])) by (le, op)) > 0.25
+        for: 10m
+        labels:
+          severity: warn
+          component: cassandra
+        annotations:
+          summary: "Cassandra LWT latency p99 is high"
+          description: "LWT operations are slow (contention, node slowness, GC, or IO)."
+          promql: "histogram_quantile(0.99, sum(rate(lwt_latency_seconds_bucket[5m])) by (le, op))"
+
+      - alert: SchedulerHttp5xx
+        expr: sum(rate(scheduler_http_requests_total{status=~"5.."}[5m])) > 0
+        for: 5m
+        labels:
+          severity: warn
+          component: scheduler
+        annotations:
+          summary: "Scheduler is returning 5xx"
+          description: "Scheduler endpoints are failing. Check Cassandra connectivity and scheduler logs."
+          promql: "sum(rate(scheduler_http_requests_total{status=~\"5..\"}[5m]))"

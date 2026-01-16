@@ -41,6 +41,9 @@ import java.util.UUID;
 
 public class SchedulerMain {
     private static final int DEFAULT_BUCKETS = 16;
+    private static final int MAX_DURATION_SECONDS_MIN = 1;
+    private static final int MAX_DURATION_SECONDS_MAX = 24 * 60 * 60;
+    private static final long DELAY_SECONDS_MAX = 30L * 24 * 60 * 60;
     private static volatile boolean ready = false;
     private static volatile boolean shuttingDown = false;
 
@@ -205,7 +208,71 @@ public class SchedulerMain {
         if (rawPath.startsWith("/jobs/")) {
             return "/jobs/:id";
         }
+        if (rawPath.startsWith("/cronjobs/")) {
+            return "/cronjobs/:id";
+        }
         return rawPath;
+    }
+
+    private static void validateJobCreateRequest(JobCreateRequest req) {
+        if (req == null) {
+            return;
+        }
+
+        boolean hasRunAt = req.getRunAt() != null && !req.getRunAt().trim().isEmpty();
+        boolean hasDelay = req.getDelaySeconds() != null;
+        boolean hasSchedule = req.getSchedule() != null && !req.getSchedule().trim().isEmpty();
+
+        if (hasRunAt && hasDelay) {
+            throw new IllegalArgumentException("Specify only one of runAt or delaySeconds");
+        }
+        if ((hasRunAt || hasDelay) && hasSchedule) {
+            throw new IllegalArgumentException("Do not combine schedule with runAt/delaySeconds");
+        }
+
+        Integer maxDurationSeconds = req.getMaxDurationSeconds();
+        if (maxDurationSeconds != null) {
+            if (maxDurationSeconds < MAX_DURATION_SECONDS_MIN || maxDurationSeconds > MAX_DURATION_SECONDS_MAX) {
+                throw new IllegalArgumentException(
+                        "maxDurationSeconds must be between " + MAX_DURATION_SECONDS_MIN + " and " + MAX_DURATION_SECONDS_MAX);
+            }
+        }
+
+        Long delaySeconds = req.getDelaySeconds();
+        if (delaySeconds != null) {
+            if (delaySeconds < 0) {
+                throw new IllegalArgumentException("delaySeconds must be >= 0");
+            }
+            if (delaySeconds > DELAY_SECONDS_MAX) {
+                throw new IllegalArgumentException("delaySeconds must be <= " + DELAY_SECONDS_MAX);
+            }
+        }
+    }
+
+    private static int normalizeMaxDurationSeconds(Integer maxDurationSeconds) {
+        int maxDur = maxDurationSeconds == null ? 3600 : maxDurationSeconds;
+        if (maxDur < MAX_DURATION_SECONDS_MIN || maxDur > MAX_DURATION_SECONDS_MAX) {
+            throw new IllegalArgumentException(
+                    "maxDurationSeconds must be between " + MAX_DURATION_SECONDS_MIN + " and " + MAX_DURATION_SECONDS_MAX);
+        }
+        return maxDur;
+    }
+
+    private static String deriveScheduleForStorage(JobCreateRequest req, Instant scheduledTime) {
+        if (req == null) {
+            return "immediate";
+        }
+        if (req.getRunAt() != null && !req.getRunAt().trim().isEmpty()) {
+            return req.getRunAt().trim();
+        }
+        if (req.getDelaySeconds() != null) {
+            return scheduledTime.toString();
+        }
+        String schedule = req.getSchedule();
+        if (schedule == null || schedule.trim().isEmpty()) {
+            return "immediate";
+        }
+        return schedule.trim();
     }
 
     private static Instant resolveScheduledTime(JobCreateRequest req) {
@@ -389,15 +456,16 @@ public class SchedulerMain {
             if ("POST".equalsIgnoreCase(exchange.getRequestMethod())) {
                 try (InputStream is = exchange.getRequestBody()) {
                     JobCreateRequest req = mapper.readValue(is, JobCreateRequest.class);
+                    validateJobCreateRequest(req);
                     UUID jobId = UUID.randomUUID();
                     Instant createdAt = Instant.now();
 
-                    String schedule = Optional.ofNullable(req.getSchedule()).orElse("immediate");
-                    int maxDur = Optional.ofNullable(req.getMaxDurationSeconds()).orElse(3600);
+                    int maxDur = normalizeMaxDurationSeconds(req.getMaxDurationSeconds());
                     Object payloadObj = Optional.ofNullable(req.getPayload()).orElse(new java.util.HashMap<>());
                     String payloadJson = mapper.writeValueAsString(payloadObj);
 
                     Instant scheduledTime = resolveScheduledTime(req);
+                    String schedule = deriveScheduleForStorage(req, scheduledTime);
 
                     BoundStatement bs = insertJobStmt.bind(jobId.toString(), schedule, payloadJson, maxDur, createdAt);
                     session.execute(bs);
@@ -412,7 +480,7 @@ public class SchedulerMain {
                 } catch (IllegalArgumentException ex) {
                     respondJson(exchange, 400, new ErrorResponse("bad_request", ex.getMessage()), mapper);
                 } catch (Exception ex) {
-                    respondJson(exchange, 400, new ErrorResponse("bad_request", ex.getMessage()), mapper);
+                    respondJson(exchange, 500, new ErrorResponse("internal_error", ex.getMessage()), mapper);
                 }
                 return;
             }
@@ -500,7 +568,7 @@ public class SchedulerMain {
                 String cronExpr = req.getCron();
                 String timezone = (req.getTimezone() == null || req.getTimezone().isBlank()) ? "UTC" : req.getTimezone().trim();
                 boolean enabled = req.getEnabled() == null ? true : req.getEnabled();
-                int maxDur = req.getMaxDurationSeconds() == null ? 3600 : req.getMaxDurationSeconds();
+                int maxDur = normalizeMaxDurationSeconds(req.getMaxDurationSeconds());
                 Object payloadObj = Optional.ofNullable(req.getPayload()).orElse(new java.util.HashMap<>());
                 String payloadJson = mapper.writeValueAsString(payloadObj);
 
@@ -531,7 +599,7 @@ public class SchedulerMain {
             } catch (IllegalArgumentException ex) {
                 respondJson(exchange, 400, new ErrorResponse("bad_request", ex.getMessage()), mapper);
             } catch (Exception ex) {
-                respondJson(exchange, 400, new ErrorResponse("bad_request", ex.getMessage()), mapper);
+                respondJson(exchange, 500, new ErrorResponse("internal_error", ex.getMessage()), mapper);
             }
         }
     }
@@ -636,6 +704,10 @@ public class SchedulerMain {
             String remainder = path.substring("/jobs/".length());
 
             if (remainder.endsWith("/run")) {
+                if (!"POST".equalsIgnoreCase(exchange.getRequestMethod())) {
+                    respondJson(exchange, 405, new ErrorResponse("method_not_allowed", exchange.getRequestMethod()), mapper);
+                    return;
+                }
                 String id = remainder.substring(0, remainder.length() - "/run".length());
                 UUID jobUuid;
                 try {
