@@ -84,6 +84,7 @@
 
     <modules>
         <module>client-lib</module>
+        <module>scheduler</module>
         <module>worker</module>
         <module>orders</module>
         <module>inventory</module>

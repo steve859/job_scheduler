@@ -53,6 +53,17 @@ CREATE TABLE IF NOT EXISTS locks (
   AND gc_grace_seconds = 60;
 
 /* =====================================================================
+    Dead Letter Queue for failed jobs
+    ===================================================================== */
+CREATE TABLE IF NOT EXISTS jobs_dlq (
+   job_id uuid PRIMARY KEY,
+   attempts int,
+   last_error text,
+   last_attempt_at timestamp,
+   payload text
+);
+
+/* =====================================================================
    SEQUENCE (UNSHARDED) - MAY BE PHASED OUT BY SHARDED SEQ
    ===================================================================== */
 CREATE TABLE IF NOT EXISTS lock_seq (
@@ -61,13 +72,13 @@ CREATE TABLE IF NOT EXISTS lock_seq (
 );
 
 /* =====================================================================
-   SHARDED SEQUENCE FOR HOT RESOURCES (resource hashed to shard_id)
-   ===================================================================== */
+    Lock sequence sharded to reduce contention (Phase 1 optimization path)
+    ===================================================================== */
 CREATE TABLE IF NOT EXISTS lock_seq_shard (
-  resource text,
-  shard_id int,
-  last_seq bigint,
-  PRIMARY KEY ((resource), shard_id)
+   resource text,
+   shard_id int,
+   last_seq bigint,
+   PRIMARY KEY ((resource), shard_id)
 );
 
 /* =====================================================================
@@ -85,6 +96,45 @@ CREATE TABLE IF NOT EXISTS jobs_sharded (
   attempts int,
   PRIMARY KEY ((bucket_id), scheduled_time, job_id)
 ) WITH default_time_to_live = 0;  /* explicit; jobs cleaned by process */
+
+/* =====================================================================
+    PENDING QUEUE VIEW PER BUCKET (to avoid ALLOW FILTERING)
+    - Enqueue writes here and jobs_sharded
+    - Pollers read from here (<= now) and delete when starting
+    ===================================================================== */
+CREATE TABLE IF NOT EXISTS jobs_pending_by_bucket (
+   bucket_id int,
+   scheduled_time timestamp,
+   job_id uuid,
+   payload text,
+   PRIMARY KEY ((bucket_id), scheduled_time, job_id)
+);
+
+/* =====================================================================
+    CRON JOBS (PHASE 4 - Scheduler)
+    ---------------------------------------------------------------------
+    - cron_jobs stores definition and next_run_at
+    - cron_pending_by_bucket allows range scan (next_run_at <= now) per bucket
+    ===================================================================== */
+CREATE TABLE IF NOT EXISTS cron_jobs (
+   cron_id uuid PRIMARY KEY,
+   cron_expr text,
+   timezone text,
+   payload text,
+   max_duration_seconds int,
+   enabled boolean,
+   bucket_id int,
+   next_run_at timestamp,
+   created_at timestamp,
+   updated_at timestamp
+);
+
+CREATE TABLE IF NOT EXISTS cron_pending_by_bucket (
+   bucket_id int,
+   next_run_at timestamp,
+   cron_id uuid,
+   PRIMARY KEY ((bucket_id), next_run_at, cron_id)
+);
 
 /* =====================================================================
    MIGRATION NOTES
